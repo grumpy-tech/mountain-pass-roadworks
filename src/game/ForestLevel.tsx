@@ -7,7 +7,7 @@ import {
   cycleForestVehicle, forestHeightAt, forestHint, forestProgress, pathPoint, recomputeForestHeights, recoverForest, roadLevelled, selectForestVehicle, stepForestGame, tankerEta,
   type ForestMachine, type ForestVehicle, type ForestWorld, type ForestGame,
 } from "./forest";
-import GroundMarks from "./GroundMarks";
+import GroundMarks from "./GroundMarksLayer";
 import { Beacon, Glass, Lamp, PAINT, Stack, Tracks, Wheels, mat, useEnv } from "./parts";
 import { FxBus, FxCtx, emitAt } from "./Particles";
 import { LevelShell, type BaseVehicle, type LevelProps, type LevelSpec } from "./Shell";

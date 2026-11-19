@@ -2,7 +2,7 @@ import { useFrame } from "@react-three/fiber";
 import { useContext, useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import CampScene, { Label } from "./Camp";
-import GroundMarks from "./GroundMarks";
+import GroundMarks from "./GroundMarksLayer";
 import { Beacon, Glass, Lamp, PAINT, Stack, Tracks, Wheels, mat } from "./parts";
 import { FxCtx, emitAt } from "./Particles";
 import { LevelShell, type BaseVehicle, type LevelProps, type LevelSpec } from "./Shell";
