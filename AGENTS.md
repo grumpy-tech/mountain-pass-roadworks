@@ -30,4 +30,8 @@ use the editor.
 <!-- LOVABLE:END -->
 
 ## Game architecture
-- Game rules (terrain, road job stages, vehicle sim) live in `src/game/world.ts` with no React/three imports; `src/game/Game.tsx` only renders that state and runs one `useFrame` stepper — keeps the sim testable and tweakable.
+- Game rules live in `src/game/*.ts` with no React/three imports; `src/game/Game.tsx` only renders that state and runs one `useFrame` stepper — keeps the sim testable and tweakable.
+  - `grid.ts`: terrain grid constants, `World` type, height/cell lookups.
+  - `world.ts`: vehicle sim, actions, `stepGame`, and `LevelConfig` (what differs per level: machines, world generation, intro hint).
+  - `levels/*.ts`: one file per level (terrain generator + `LevelConfig`), registered in `levels/index.ts`. Adding a level should not require touching other levels.
+- `src/game/mountain.test.ts` pins the mountain level's generated world and a scripted drive. If shared code changes it, the mountain level changed — fix the code, don't just update the numbers.

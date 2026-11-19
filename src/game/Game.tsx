@@ -3,11 +3,17 @@ import { Environment, Lightformer } from "@react-three/drei";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import {
-  CELL, HALF, MACHINES, N, TRUCK_CAPACITY, createGame, currentAction, heightAt, progress, recomputeHeights, recover, stepGame, switchVehicle,
-  type Game as GameState, type Vehicle, type World,
+  CELL, HALF, MACHINES, N, TRUCK_CAPACITY, craneAction, createGame, currentAction, heightAt, progress, recomputeHeights, recover, stepGame, switchVehicle, toggleCamera,
+  type Game as GameState, type LevelConfig, type Vehicle, type World,
 } from "./world";
+import { MOUNTAIN_LEVEL } from "./levels/mountain";
+import { BuildingMesh, CraneMesh, DeliveryTrucks, HookGuides, Pallets, StreetLife, UrbanScenery } from "./UrbanSite";
+import { CraneGauges, UrbanControls, UrbanResults, UrbanTasks } from "./UrbanHud";
+import { readSiteHud, type SiteHud } from "./siteHud";
 
 const keys = new Set<string>();
+/** Mouse-wheel zoom for the crane overview camera. */
+const view = { zoom: 1 };
 const DIRT = new THREE.Color("#8a6a45"), ASPHALT = new THREE.Color("#3a3c40");
 
 function Terrain({ world }: { world: World }) {
@@ -24,6 +30,7 @@ function Terrain({ world }: { world: World }) {
     const pos = geo.getAttribute("position") as THREE.BufferAttribute;
     for (let v = 0; v < pos.count; v++) pos.setY(v, world.heights[v]);
     pos.needsUpdate = true;
+    (geo.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true; // digging darkens soil
     geo.computeVertexNormals();
   });
   return (
@@ -237,16 +244,52 @@ function Director({ game, onReady }: { game: GameState; onReady: () => void }) {
   const light = useRef<THREE.DirectionalLight>(null!);
   const { camera } = useThree();
   const frames = useRef(0);
+  const look = useRef(new THREE.Vector3());
+  const lastCam = useRef<string>("overview");
+  const tmp = useMemo(() => new THREE.Vector3(), []);
   useFrame((_, delta) => {
     const dt = Math.min(delta, 0.05);
-    const throttle = (keys.has("w") || keys.has("arrowup") ? 1 : 0) - (keys.has("s") || keys.has("arrowdown") ? 1 : 0);
-    const steer = (keys.has("a") || keys.has("arrowleft") ? 1 : 0) - (keys.has("d") || keys.has("arrowright") ? 1 : 0);
-    stepGame(game, { throttle, steer, action: keys.has(" ") }, dt);
+    const cranePilot = game.vehicles[game.active].kind === "crane";
+    const k = (n: string) => keys.has(n);
+    // crane: W/S trolley, A/D slew, arrows up/down hoist. Vehicles: arrows mirror WASD.
+    const throttle = (k("w") || (!cranePilot && k("arrowup")) ? 1 : 0) - (k("s") || (!cranePilot && k("arrowdown")) ? 1 : 0);
+    const steer = (k("a") || k("arrowleft") ? 1 : 0) - (k("d") || k("arrowright") ? 1 : 0);
+    const lift = cranePilot ? (k("arrowup") ? 1 : 0) - (k("arrowdown") ? 1 : 0) : 0;
+    stepGame(game, { throttle, steer, action: k(" "), lift }, dt);
     const v = game.vehicles[game.active];
-    camera.position.lerp(new THREE.Vector3(v.x + 6, v.y + 42, v.z + 16), 1 - Math.exp(-3 * dt));
-    camera.lookAt(v.x, v.y, v.z);
-    light.current.position.set(v.x + 20, v.y + 40, v.z + 10);
-    light.current.target.position.set(v.x, v.y, v.z);
+    const cam = camera as THREE.PerspectiveCamera;
+    const site = game.site;
+    let fx = v.x, fy = v.y, fz = v.z;
+    let fov = 40;
+    if (site && v.kind === "crane") {
+      const c = site.crane;
+      if (game.cam === "cab") {
+        // operator's seat on the slewing unit, looking at the load
+        const th = c.slew;
+        const ex = c.cfg.x + 1.5 * Math.cos(th) + 0.5 * Math.sin(th), ez = c.cfg.z - 1.5 * Math.sin(th) + 0.5 * Math.cos(th);
+        cam.position.set(ex, c.cfg.jibY + 0.7, ez);
+        if (lastCam.current !== "cab") look.current.set(c.hook.x, c.hook.y, c.hook.z);
+        look.current.lerp(tmp.set(c.hook.x, c.hook.y - 1.5, c.hook.z), 1 - Math.exp(-7 * dt));
+        cam.lookAt(look.current);
+        fov = 62;
+      } else {
+        // follow the hook, leaning a little toward the building so both stay in frame
+        const b = site.cfg.footprint, bx = (b.x0 + b.x1) / 2, bz = (b.z0 + b.z1) / 2;
+        fx = c.hook.x + (bx - c.hook.x) * 0.2; fy = Math.max(0, c.hook.y * 0.25); fz = c.hook.z + (bz - c.hook.z) * 0.2;
+        // stay above the jib so the boom never sits between the camera and the lot
+        const camY = Math.max(fy + 40 * view.zoom, c.cfg.jibY + 10);
+        cam.position.lerp(tmp.set(fx + 8 * view.zoom, camY, fz + 24 * view.zoom), 1 - Math.exp(-3 * dt));
+        cam.lookAt(fx, fy, fz);
+      }
+      lastCam.current = game.cam;
+    } else {
+      lastCam.current = "overview";
+      cam.position.lerp(tmp.set(v.x + 6, v.y + 42, v.z + 16), 1 - Math.exp(-3 * dt));
+      cam.lookAt(v.x, v.y, v.z);
+    }
+    if (Math.abs(cam.fov - fov) > 0.01) { cam.fov += (fov - cam.fov) * Math.min(1, 8 * dt); cam.updateProjectionMatrix(); }
+    light.current.position.set(fx + 20, fy + 40, fz + 10);
+    light.current.target.position.set(fx, fy, fz);
     light.current.target.updateMatrixWorld();
     if (++frames.current === 3) onReady();
   });
@@ -256,10 +299,10 @@ function Director({ game, onReady }: { game: GameState; onReady: () => void }) {
   );
 }
 
-export default function Game() {
-  const game = useMemo(() => createGame(), []);
+export default function Game({ level = MOUNTAIN_LEVEL, onExit = () => {} }: { level?: LevelConfig; onExit?: () => void }) {
+  const game = useMemo(() => createGame(level), [level]);
   const world = game.world;
-  const [hud, setHud] = useState(() => ({ ...progress(world), active: 0, speed: 0, msg: "", action: "", actionT: 0, actionMax: 1, cargo: "", won: false }));
+  const [hud, setHud] = useState(() => ({ ...progress(world), active: 0, speed: 0, msg: "", action: "", actionT: 0, actionMax: 1, cargo: "", won: false, site: readSiteHud(game) as SiteHud | null }));
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
@@ -269,18 +312,22 @@ export default function Game() {
       if (k === " " || k.startsWith("arrow")) e.preventDefault();
       if (k === "e" && !e.repeat) switchVehicle(game);
       if (k === "r" && !e.repeat) recover(game);
+      if (k === "c" && !e.repeat) toggleCamera(game);
+      if (k === " " && !e.repeat) craneAction(game);
       keys.add(k);
     };
     const up = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
     const blur = () => keys.clear();
+    const wheel = (e: WheelEvent) => { view.zoom = Math.min(2.2, Math.max(0.6, view.zoom * Math.exp(e.deltaY * 0.001))); };
+    window.addEventListener("wheel", wheel, { passive: true });
     window.addEventListener("keydown", down); window.addEventListener("keyup", up); window.addEventListener("blur", blur);
     const id = setInterval(() => {
       const v = game.vehicles[game.active];
       const a = currentAction(game);
       const cargo = v.kind === "truck" ? `Load ${v.dirt + v.rock}/${TRUCK_CAPACITY} (${v.dirt} dirt, ${v.rock} rock)` : v.kind === "excavator" ? (v.dirt ? "Bucket: dirt" : v.rock ? "Bucket: rock" : "Bucket: empty") : "";
-      setHud({ ...progress(world), active: game.active, speed: Math.abs(v.speed), msg: game.msgT > 0 ? game.msg : "", action: a ? a.label : "", actionT: game.actionT, actionMax: a && Number.isFinite(a.time) ? a.time : 0, cargo, won: game.won });
+      setHud({ ...progress(world), active: game.active, speed: Math.abs(v.speed), msg: game.msgT > 0 ? game.msg : "", action: a ? a.label : "", actionT: game.actionT, actionMax: a && Number.isFinite(a.time) ? a.time : 0, cargo, won: game.won, site: readSiteHud(game) });
     }, 120);
-    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); window.removeEventListener("blur", blur); clearInterval(id); };
+    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); window.removeEventListener("blur", blur); window.removeEventListener("wheel", wheel); clearInterval(id); };
   }, [game, world]);
 
   const v = game.vehicles[hud.active];
@@ -302,34 +349,54 @@ export default function Game() {
           <Lightformer intensity={0.8} color="#ffd9a8" position={[-5, 1, -1]} rotation-y={Math.PI / 2} scale={[20, 1, 1]} />
         </Environment>
         <Terrain world={world} />
-        <RoadWork world={world} />
-        <Hazards world={world} />
-        <Rocks world={world} />
-        <Scenery world={world} />
-        {game.vehicles.map((veh, i) => <VehicleMesh key={i} v={veh} active={i === hud.active} />)}
+        {game.site ? (
+          <>
+            <UrbanScenery site={game.site} />
+            <StreetLife />
+            <BuildingMesh site={game.site} />
+            <CraneMesh site={game.site} hideCab={() => game.cam === "cab" && game.vehicles[game.active].kind === "crane"} />
+            <Pallets site={game.site} />
+            <DeliveryTrucks site={game.site} />
+            <HookGuides site={game.site} world={world} />
+          </>
+        ) : (
+          <>
+            <RoadWork world={world} />
+            <Hazards world={world} />
+            <Rocks world={world} />
+            <Scenery world={world} />
+          </>
+        )}
+        {game.vehicles.map((veh, i) => (veh.kind === "crane" ? null : <VehicleMesh key={i} v={veh} active={i === hud.active} />))}
         <Director game={game} onReady={() => setReady(true)} />
       </Canvas>
 
       <div className="pointer-events-none absolute left-4 top-4 w-80 rounded-md border-2 border-foreground/80 bg-card/90 p-4 font-mono text-sm text-card-foreground shadow-lg">
-        <div className="text-xs uppercase tracking-widest text-muted-foreground">Job · Pass Road</div>
+        <div className="text-xs uppercase tracking-widest text-muted-foreground">Job · {level.job}</div>
         <div className="mt-1 flex items-baseline justify-between">
           <span className="text-lg font-bold">{MACHINES[v.kind].label}</span>
-          <span className="text-xs text-muted-foreground">{(hud.speed * 3.6).toFixed(0)} km/h</span>
+          {v.kind !== "crane" && <span className="text-xs text-muted-foreground">{(hud.speed * 3.6).toFixed(0)} km/h</span>}
         </div>
         {hud.cargo && <div className="text-xs">{hud.cargo}</div>}
-        <ul className="mt-3 space-y-1">
-          {tasks.map(([l, val, ok]) => (
-            <li key={l} className="flex justify-between">
-              <span className={ok ? "text-muted-foreground line-through" : ""}>{l}</span><span>{val}</span>
-            </li>
-          ))}
-        </ul>
-        <div className="mt-2 h-2 bg-muted"><div className="h-2 bg-primary" style={{ width: `${hud.paved * 100}%` }} /></div>
+        {hud.site ? <UrbanTasks h={hud.site} /> : (
+          <>
+            <ul className="mt-3 space-y-1">
+              {tasks.map(([l, val, ok]) => (
+                <li key={l} className="flex justify-between">
+                  <span className={ok ? "text-muted-foreground line-through" : ""}>{l}</span><span>{val}</span>
+                </li>
+              ))}
+            </ul>
+            <div className="mt-2 h-2 bg-muted"><div className="h-2 bg-primary" style={{ width: `${hud.paved * 100}%` }} /></div>
+          </>
+        )}
       </div>
+      {hud.site?.inCrane && <CraneGauges h={hud.site} />}
 
-      {(hud.action || hud.msg) && (
-        <div className="pointer-events-none absolute left-1/2 top-6 -translate-x-1/2 space-y-2 text-center font-mono text-sm">
+      {(hud.action || hud.msg || hud.site?.hint) && (
+        <div className="pointer-events-none absolute left-1/2 top-6 w-[min(36rem,calc(100vw-42rem))] min-w-72 -translate-x-1/2 space-y-2 text-center font-mono text-sm">
           {hud.msg && <div className="rounded-md bg-foreground px-4 py-2 text-background">{hud.msg}</div>}
+          {hud.site?.hint && !hud.msg && <div className="rounded-md bg-card/90 px-4 py-2 text-xs text-muted-foreground">{hud.site.hint}</div>}
           {hud.action && (
             <div className="rounded-md bg-card/90 px-4 py-2 text-card-foreground">
               {hud.actionMax ? <><b>Hold Space</b> · {hud.action}</> : hud.action}
@@ -341,14 +408,19 @@ export default function Game() {
         </div>
       )}
 
-      <div className="pointer-events-none absolute bottom-4 left-4 max-w-xl rounded-md bg-card/85 px-4 py-3 font-mono text-xs text-card-foreground">
-        <b>W/S</b> drive · <b>A/D</b> steer · <b>Space</b> work (hold) · <b>E</b> hop into nearby machine · <b>R</b> recover
-        <div className="mt-1 text-muted-foreground">
-          Bulldozer pushes small rocks off the road and flattens dirt · Excavator breaks boulders, digs mounds, loads the truck · Dump truck fills mud holes or dumps off-road · Paver paves flat dirt. Watch steep edges — loaded trucks tip easily and bog down in mud.
+      {hud.site ? <UrbanControls h={hud.site} /> : (
+        <div className="pointer-events-none absolute bottom-4 left-4 max-w-xl rounded-md bg-card/85 px-4 py-3 font-mono text-xs text-card-foreground">
+          <b>W/S</b> drive · <b>A/D</b> steer · <b>Space</b> work (hold) · <b>E</b> hop into nearby machine · <b>R</b> recover
+          <div className="mt-1 text-muted-foreground">
+            Bulldozer pushes small rocks off the road and flattens dirt · Excavator breaks boulders, digs mounds, loads the truck · Dump truck fills mud holes or dumps off-road · Paver paves flat dirt. Watch steep edges — loaded trucks tip easily and bog down in mud.
+          </div>
         </div>
-      </div>
+      )}
 
-      {hud.won && (
+      <button className="absolute bottom-4 right-4 rounded-md border-2 border-foreground/80 bg-card/90 px-3 py-2 font-mono text-xs text-card-foreground hover:bg-muted" onClick={onExit}>Levels</button>
+
+      {hud.won && hud.site && <UrbanResults h={hud.site} onExit={onExit} />}
+      {hud.won && !hud.site && (
         <div className="absolute inset-0 flex items-center justify-center bg-foreground/40">
           <div className="rounded-md border-2 border-foreground bg-card p-8 text-center font-mono">
             <div className="text-2xl font-bold">Road complete!</div>
