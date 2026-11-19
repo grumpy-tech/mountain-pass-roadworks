@@ -2,7 +2,10 @@ import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Environment, Lightformer } from "@react-three/drei";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
-import { CELL, HALF, MACHINES, N, createTruck, createWorld, heightAt, progress, recomputeHeights, stepTruck, type Truck, type World } from "./world";
+import {
+  CELL, HALF, MACHINES, N, TRUCK_CAPACITY, createGame, currentAction, heightAt, progress, recomputeHeights, recover, stepGame, switchVehicle,
+  type Game as GameState, type Vehicle, type World,
+} from "./world";
 
 const keys = new Set<string>();
 const DIRT = new THREE.Color("#8a6a45"), ASPHALT = new THREE.Color("#3a3c40");
@@ -32,43 +35,84 @@ function Terrain({ world }: { world: World }) {
 
 function RoadWork({ world }: { world: World }) {
   const tiles = useRef<THREE.InstancedMesh>(null!);
-  const rocks = useRef<THREE.InstancedMesh>(null!);
   const m = useMemo(() => new THREE.Object3D(), []);
   const update = (idx: number) => {
     const r = world.road[idx];
-    const y = heightAt(world, r.x, r.z);
-    m.position.set(r.x, y + 0.6 * Math.min(1, r.hp), r.z);
-    m.rotation.set(r.hp * 3, idx, 0);
-    m.scale.setScalar(r.stage === 0 ? 0.35 + r.hp * 0.25 : 0);
-    m.updateMatrix(); rocks.current.setMatrixAt(idx, m.matrix);
-    m.position.set(r.x, y + 0.03, r.z); m.rotation.set(0, 0, 0);
+    m.position.set(r.x, heightAt(world, r.x, r.z) + 0.03, r.z);
     m.scale.set(r.stage >= 2 ? 1 : 0, 1, r.stage >= 2 ? 1 : 0);
     m.updateMatrix(); tiles.current.setMatrixAt(idx, m.matrix);
     tiles.current.setColorAt(idx, r.stage === 3 ? ASPHALT : DIRT);
   };
-  useEffect(() => {
-    world.road.forEach((_, i) => update(i));
-    tiles.current.instanceMatrix.needsUpdate = true; rocks.current.instanceMatrix.needsUpdate = true;
+  const flush = () => {
+    tiles.current.instanceMatrix.needsUpdate = true;
     if (tiles.current.instanceColor) tiles.current.instanceColor.needsUpdate = true;
-  }, [world]);
+  };
+  useEffect(() => { world.road.forEach((_, i) => update(i)); flush(); }, [world]);
   useFrame(() => {
     if (!world.dirtyCells.size) return;
     for (const c of world.dirtyCells) update(world.cellToRoad[c]);
-    world.dirtyCells.clear();
-    tiles.current.instanceMatrix.needsUpdate = true; rocks.current.instanceMatrix.needsUpdate = true;
-    if (tiles.current.instanceColor) tiles.current.instanceColor.needsUpdate = true;
+    world.dirtyCells.clear(); flush();
+  });
+  return (
+    <instancedMesh ref={tiles} args={[undefined, undefined, world.road.length]} receiveShadow>
+      <boxGeometry args={[CELL * 1.02, 0.12, CELL * 1.02]} />
+      <meshStandardMaterial roughness={0.9} />
+    </instancedMesh>
+  );
+}
+
+function Hazards({ world }: { world: World }) {
+  const mounds = useRef<THREE.InstancedMesh>(null!), mud = useRef<THREE.InstancedMesh>(null!);
+  const moundCells = useMemo(() => world.road.filter((r) => r.kind === "mound"), [world]);
+  useFrame(() => {
+    if (!world.dirtyHazards) return;
+    world.dirtyHazards = false;
+    const o = new THREE.Object3D();
+    moundCells.forEach((r, i) => {
+      const s = r.kind === "mound" ? 0.5 + r.mound * 0.35 : 0;
+      o.position.set(r.x, heightAt(world, r.x, r.z), r.z); o.rotation.set(0, i * 1.7, 0); o.scale.set(s * 1.3, s, s * 1.3);
+      o.updateMatrix(); mounds.current.setMatrixAt(i, o.matrix);
+    });
+    world.mudCells.forEach((c, i) => {
+      const x = -HALF + ((c % N) + 0.5) * CELL, z = -HALF + (Math.floor(c / N) + 0.5) * CELL;
+      const s = world.mud[c] ? 1 : 0;
+      o.position.set(x, heightAt(world, x, z) + 0.06, z); o.rotation.set(0, 0, 0); o.scale.set(s, 1, s);
+      o.updateMatrix(); mud.current.setMatrixAt(i, o.matrix);
+    });
+    mounds.current.instanceMatrix.needsUpdate = true; mud.current.instanceMatrix.needsUpdate = true;
   });
   return (
     <>
-      <instancedMesh ref={tiles} args={[undefined, undefined, world.road.length]} receiveShadow>
-        <boxGeometry args={[CELL * 1.02, 0.12, CELL * 1.02]} />
-        <meshStandardMaterial roughness={0.9} />
+      <instancedMesh ref={mounds} args={[undefined, undefined, Math.max(1, moundCells.length)]} castShadow receiveShadow>
+        <coneGeometry args={[1.2, 1.4, 7]} /><meshStandardMaterial color="#7a5533" flatShading />
       </instancedMesh>
-      <instancedMesh ref={rocks} args={[undefined, undefined, world.road.length]} castShadow>
-        <dodecahedronGeometry args={[1, 0]} />
-        <meshStandardMaterial color="#7d7770" flatShading />
+      <instancedMesh ref={mud} args={[undefined, undefined, Math.max(1, world.mudCells.length)]}>
+        <boxGeometry args={[CELL * 1.05, 0.08, CELL * 1.05]} /><meshStandardMaterial color="#3b2a1c" roughness={0.25} metalness={0.1} />
       </instancedMesh>
     </>
+  );
+}
+
+function Rocks({ world }: { world: World }) {
+  const ref = useRef<THREE.InstancedMesh>(null!);
+  const o = useMemo(() => new THREE.Object3D(), []);
+  useFrame(() => {
+    const mesh = ref.current;
+    for (let i = 0; i < world.rockCapacity; i++) {
+      const r = world.rocks[i];
+      if (r) {
+        o.position.set(r.x, heightAt(world, r.x, r.z) + r.r * 0.6, r.z);
+        o.rotation.set(r.spin, r.id, r.spin * 0.5);
+        o.scale.set(r.r, r.r * 0.8, r.r);
+      } else o.scale.setScalar(0);
+      o.updateMatrix(); mesh.setMatrixAt(i, o.matrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  });
+  return (
+    <instancedMesh ref={ref} args={[undefined, undefined, Math.max(1, world.rockCapacity)]} castShadow frustumCulled={false}>
+      <dodecahedronGeometry args={[1, 0]} /><meshStandardMaterial color="#7d7770" flatShading />
+    </instancedMesh>
   );
 }
 
@@ -100,37 +144,96 @@ function Scenery({ world }: { world: World }) {
   );
 }
 
-function Track({ x }: { x: number }) {
+const mat = (c: string) => <meshStandardMaterial color={c} flatShading />;
+
+function Tracks() {
   return (
-    <mesh position={[x, 0.35, 0]} castShadow>
-      <boxGeometry args={[0.55, 0.7, 3.2]} /><meshStandardMaterial color="#2a2a2a" flatShading />
-    </mesh>
+    <>
+      {[-0.95, 0.95].map((x) => (
+        <mesh key={x} position={[x, 0.35, 0]} castShadow><boxGeometry args={[0.55, 0.7, 3.2]} />{mat("#2a2a2a")}</mesh>
+      ))}
+    </>
   );
 }
 
-function TruckMesh({ machine }: { machine: string }) {
-  const body = machine === "dozer" ? "#e8b322" : "#e06b24";
+function Wheels() {
   return (
-    <group>
-      <Track x={-0.95} /><Track x={0.95} />
-      <mesh position={[0, 1.05, -0.2]} castShadow><boxGeometry args={[1.6, 0.8, 2.4]} /><meshStandardMaterial color={body} flatShading /></mesh>
-      <mesh position={[0, 1.85, -0.6]} castShadow><boxGeometry args={[1.2, 0.9, 1.1]} /><meshStandardMaterial color={body} flatShading /></mesh>
-      <mesh position={[0, 1.95, -0.05]}><boxGeometry args={[1.1, 0.6, 0.05]} /><meshStandardMaterial color="#9fc7d8" metalness={0.3} roughness={0.2} /></mesh>
-      <mesh position={[0.5, 1.9, 0.6]} castShadow><cylinderGeometry args={[0.08, 0.08, 1, 6]} /><meshStandardMaterial color="#333" /></mesh>
-      {machine === "dozer" ? (
-        <mesh position={[0, 0.55, 2.1]} rotation={[0.2, 0, 0]} castShadow><boxGeometry args={[3.2, 1, 0.25]} /><meshStandardMaterial color="#c99a1a" flatShading /></mesh>
-      ) : (
+    <>
+      {[-1.05, 1.05].flatMap((x) => [-1.3, 0, 1.4].map((z) => (
+        <mesh key={`${x}${z}`} position={[x, 0.5, z]} rotation={[0, 0, Math.PI / 2]} castShadow>
+          <cylinderGeometry args={[0.5, 0.5, 0.45, 8]} />{mat("#222")}
+        </mesh>
+      )))}
+    </>
+  );
+}
+
+function VehicleMesh({ v, active }: { v: Vehicle; active: boolean }) {
+  const g = useRef<THREE.Group>(null!);
+  const arm = useRef<THREE.Group>(null!);
+  const load = useRef<THREE.Mesh>(null!);
+  const marker = useRef<THREE.Mesh>(null!);
+  useFrame(({ clock }) => {
+    g.current.position.set(v.x, v.y, v.z);
+    g.current.rotation.set(0, 0, 0);
+    g.current.rotateY(v.heading); g.current.rotateX(v.pitch); g.current.rotateZ(v.roll);
+    if (arm.current) arm.current.rotation.x = -0.25 + Math.sin(clock.elapsedTime * 6) * 0.35 * v.work + (v.dirt + v.rock > 0 ? -0.4 : 0);
+    if (load.current) {
+      const f = (v.dirt + v.rock) / (v.kind === "truck" ? TRUCK_CAPACITY : 1);
+      load.current.visible = f > 0;
+      load.current.scale.set(1, Math.max(0.01, f), 1);
+    }
+    if (marker.current) { marker.current.visible = active; marker.current.position.y = 4.2 + Math.sin(clock.elapsedTime * 3) * 0.2; }
+  });
+  const yellow = "#e8b322";
+  return (
+    <group ref={g}>
+      <mesh ref={marker} rotation={[Math.PI, 0, 0]}><coneGeometry args={[0.4, 0.8, 4]} />{mat("#ffffff")}</mesh>
+      {v.kind === "dozer" && (
         <>
-          <mesh position={[0, 0.9, 1.5]} castShadow><boxGeometry args={[2, 0.9, 0.9]} /><meshStandardMaterial color="#555" flatShading /></mesh>
-          <mesh position={[0, 0.3, -1.9]} rotation={[0, 0, Math.PI / 2]} castShadow><cylinderGeometry args={[0.35, 0.35, 3, 8]} /><meshStandardMaterial color="#444" flatShading /></mesh>
+          <Tracks />
+          <mesh position={[0, 1.05, -0.2]} castShadow><boxGeometry args={[1.6, 0.8, 2.4]} />{mat(yellow)}</mesh>
+          <mesh position={[0, 1.85, -0.6]} castShadow><boxGeometry args={[1.2, 0.9, 1.1]} />{mat(yellow)}</mesh>
+          <mesh position={[0, 0.55, 2.1]} rotation={[0.2, 0, 0]} castShadow><boxGeometry args={[3.2, 1, 0.25]} />{mat("#c99a1a")}</mesh>
+        </>
+      )}
+      {v.kind === "excavator" && (
+        <>
+          <Tracks />
+          <mesh position={[0, 1.1, -0.3]} castShadow><boxGeometry args={[1.9, 0.7, 2.6]} />{mat("#d9902a")}</mesh>
+          <mesh position={[-0.45, 1.9, 0.2]} castShadow><boxGeometry args={[0.9, 0.9, 1.1]} />{mat("#d9902a")}</mesh>
+          <group ref={arm} position={[0.4, 1.5, 0.6]}>
+            <mesh position={[0, 0.6, 1.2]} rotation={[-0.5, 0, 0]} castShadow><boxGeometry args={[0.35, 0.4, 2.8]} />{mat("#c07a1e")}</mesh>
+            <mesh position={[0, 0.1, 2.7]} rotation={[0.6, 0, 0]} castShadow><boxGeometry args={[0.3, 0.3, 1.6]} />{mat("#c07a1e")}</mesh>
+            <mesh position={[0, -0.6, 3.2]} castShadow><boxGeometry args={[0.9, 0.6, 0.6]} />{mat("#444")}</mesh>
+            <mesh ref={load} position={[0, -0.35, 3.2]}><boxGeometry args={[0.8, 0.3, 0.5]} />{mat(v.rock ? "#7d7770" : "#6b4a2b")}</mesh>
+          </group>
+        </>
+      )}
+      {v.kind === "truck" && (
+        <>
+          <Wheels />
+          <mesh position={[0, 1.4, 1.7]} castShadow><boxGeometry args={[1.9, 1.3, 1.2]} />{mat("#c8392b")}</mesh>
+          <mesh position={[0, 1.6, 2.32]}><boxGeometry args={[1.6, 0.5, 0.05]} /><meshStandardMaterial color="#9fc7d8" metalness={0.3} roughness={0.2} /></mesh>
+          <mesh position={[0, 0.9, -0.2]} castShadow><boxGeometry args={[2.1, 0.3, 4]} />{mat("#333")}</mesh>
+          <mesh position={[0, 1.55, -0.5]} castShadow><boxGeometry args={[2.2, 1, 3]} />{mat("#a8a8a8")}</mesh>
+          <mesh ref={load} position={[0, 2.05, -0.5]}><boxGeometry args={[2, 0.8, 2.8]} />{mat("#6b4a2b")}</mesh>
+        </>
+      )}
+      {v.kind === "paver" && (
+        <>
+          <Tracks />
+          <mesh position={[0, 1.05, -0.2]} castShadow><boxGeometry args={[1.6, 0.8, 2.4]} />{mat("#e06b24")}</mesh>
+          <mesh position={[0, 1.85, -0.6]} castShadow><boxGeometry args={[1.2, 0.9, 1.1]} />{mat("#e06b24")}</mesh>
+          <mesh position={[0, 0.9, 1.5]} castShadow><boxGeometry args={[2, 0.9, 0.9]} />{mat("#555")}</mesh>
+          <mesh position={[0, 0.3, -1.9]} rotation={[0, 0, Math.PI / 2]} castShadow><cylinderGeometry args={[0.35, 0.35, 3, 8]} />{mat("#444")}</mesh>
         </>
       )}
     </group>
   );
 }
 
-function Player({ world, truck, machine, onReady }: { world: World; truck: Truck; machine: string; onReady: () => void }) {
-  const g = useRef<THREE.Group>(null!);
+function Director({ game, onReady }: { game: GameState; onReady: () => void }) {
   const light = useRef<THREE.DirectionalLight>(null!);
   const { camera } = useThree();
   const frames = useRef(0);
@@ -138,56 +241,59 @@ function Player({ world, truck, machine, onReady }: { world: World; truck: Truck
     const dt = Math.min(delta, 0.05);
     const throttle = (keys.has("w") || keys.has("arrowup") ? 1 : 0) - (keys.has("s") || keys.has("arrowdown") ? 1 : 0);
     const steer = (keys.has("a") || keys.has("arrowleft") ? 1 : 0) - (keys.has("d") || keys.has("arrowright") ? 1 : 0);
-    stepTruck(world, truck, { throttle, steer }, dt);
-    g.current.position.set(truck.x, truck.y, truck.z);
-    g.current.rotation.set(0, 0, 0);
-    g.current.rotateY(truck.heading); g.current.rotateX(truck.pitch); g.current.rotateZ(truck.roll);
-    const target = new THREE.Vector3(truck.x + 6, truck.y + 42, truck.z + 16);
-    camera.position.lerp(target, 1 - Math.exp(-3 * dt));
-    camera.lookAt(truck.x, truck.y, truck.z);
-    light.current.position.set(truck.x + 20, truck.y + 40, truck.z + 10);
-    light.current.target.position.set(truck.x, truck.y, truck.z);
+    stepGame(game, { throttle, steer, action: keys.has(" ") }, dt);
+    const v = game.vehicles[game.active];
+    camera.position.lerp(new THREE.Vector3(v.x + 6, v.y + 42, v.z + 16), 1 - Math.exp(-3 * dt));
+    camera.lookAt(v.x, v.y, v.z);
+    light.current.position.set(v.x + 20, v.y + 40, v.z + 10);
+    light.current.target.position.set(v.x, v.y, v.z);
     light.current.target.updateMatrixWorld();
     if (++frames.current === 3) onReady();
   });
   return (
-    <>
-      <directionalLight ref={light} intensity={2.4} color="#fff1d6" castShadow shadow-mapSize={[2048, 2048]}
-        shadow-camera-left={-40} shadow-camera-right={40} shadow-camera-top={40} shadow-camera-bottom={-40} shadow-bias={-0.0005} />
-      <group ref={g}><TruckMesh machine={machine} /></group>
-    </>
+    <directionalLight ref={light} intensity={2.4} color="#fff1d6" castShadow shadow-mapSize={[2048, 2048]}
+      shadow-camera-left={-40} shadow-camera-right={40} shadow-camera-top={40} shadow-camera-bottom={-40} shadow-bias={-0.0005} />
   );
 }
 
 export default function Game() {
-  const world = useMemo(() => createWorld(), []);
-  const truck = useMemo(() => createTruck(world), [world]);
-  const [machine, setMachine] = useState(truck.machine);
-  const [hud, setHud] = useState({ cleared: 0, graded: 0, paved: 0, speed: 0 });
+  const game = useMemo(() => createGame(), []);
+  const world = game.world;
+  const [hud, setHud] = useState(() => ({ ...progress(world), active: 0, speed: 0, msg: "", action: "", actionT: 0, actionMax: 1, cargo: "", won: false }));
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
+    if (typeof window !== "undefined") (window as unknown as { __game: GameState }).__game = game;
     const down = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
-      if (k === "tab" || k === "q") {
-        e.preventDefault();
-        truck.machine = truck.machine === "dozer" ? "paver" : "dozer";
-        truck.speed = 0;
-        setMachine(truck.machine);
-      }
-      if (k === "r") { const t = createTruck(world); Object.assign(truck, { ...t, machine: truck.machine }); }
+      if (k === " " || k.startsWith("arrow")) e.preventDefault();
+      if (k === "e" && !e.repeat) switchVehicle(game);
+      if (k === "r" && !e.repeat) recover(game);
       keys.add(k);
     };
     const up = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
-    window.addEventListener("keydown", down); window.addEventListener("keyup", up);
-    const id = setInterval(() => setHud({ ...progress(world), speed: Math.abs(truck.speed) }), 200);
-    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); clearInterval(id); };
-  }, [world, truck]);
+    const blur = () => keys.clear();
+    window.addEventListener("keydown", down); window.addEventListener("keyup", up); window.addEventListener("blur", blur);
+    const id = setInterval(() => {
+      const v = game.vehicles[game.active];
+      const a = currentAction(game);
+      const cargo = v.kind === "truck" ? `Load ${v.dirt + v.rock}/${TRUCK_CAPACITY} (${v.dirt} dirt, ${v.rock} rock)` : v.kind === "excavator" ? (v.dirt ? "Bucket: dirt" : v.rock ? "Bucket: rock" : "Bucket: empty") : "";
+      setHud({ ...progress(world), active: game.active, speed: Math.abs(v.speed), msg: game.msgT > 0 ? game.msg : "", action: a ? a.label : "", actionT: game.actionT, actionMax: a && Number.isFinite(a.time) ? a.time : 0, cargo, won: game.won });
+    }, 120);
+    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); window.removeEventListener("blur", blur); clearInterval(id); };
+  }, [game, world]);
 
-  const done = hud.paved >= 0.95;
+  const v = game.vehicles[hud.active];
+  const tasks: [string, string, boolean][] = [
+    ["Rocks off the road", hud.rocksOnRoad ? `${hud.rocksOnRoad} left` : "done", !hud.rocksOnRoad],
+    ["Dirt mounds dug", hud.mounds ? `${hud.mounds} left` : "done", !hud.mounds],
+    ["Mud holes filled", hud.mud ? `${hud.mud} left` : "done", !hud.mud],
+    ["Graded", `${Math.floor(hud.graded * 100)}%`, hud.graded > 0.95],
+    ["Paved", `${Math.floor(hud.paved * 100)}%`, hud.paved >= 0.95],
+  ];
   return (
     <div className="relative h-screen w-full overflow-hidden" data-scene-ready={ready ? "" : undefined}>
-      <Canvas shadows camera={{ fov: 40, position: [truck.x + 6, 42, truck.z + 16], far: 400 }}>
+      <Canvas shadows camera={{ fov: 40, position: [v.x + 6, 42, v.z + 16], far: 400 }}>
         <color attach="background" args={["#b9d3e0"]} />
         <fog attach="fog" args={["#b9d3e0", 60, 160]} />
         <hemisphereLight args={["#dbeeff", "#6b5a3e", 0.5]} />
@@ -197,28 +303,52 @@ export default function Game() {
         </Environment>
         <Terrain world={world} />
         <RoadWork world={world} />
+        <Hazards world={world} />
+        <Rocks world={world} />
         <Scenery world={world} />
-        <Player world={world} truck={truck} machine={machine} onReady={() => setReady(true)} />
+        {game.vehicles.map((veh, i) => <VehicleMesh key={i} v={veh} active={i === hud.active} />)}
+        <Director game={game} onReady={() => setReady(true)} />
       </Canvas>
 
-      <div className="pointer-events-none absolute left-4 top-4 w-72 rounded-md border-2 border-foreground/80 bg-card/90 p-4 font-mono text-sm text-card-foreground shadow-lg">
+      <div className="pointer-events-none absolute left-4 top-4 w-80 rounded-md border-2 border-foreground/80 bg-card/90 p-4 font-mono text-sm text-card-foreground shadow-lg">
         <div className="text-xs uppercase tracking-widest text-muted-foreground">Job · Pass Road</div>
-        <div className="mt-1 text-lg font-bold">{MACHINES[machine].label}</div>
-        {[["Cleared", hud.cleared], ["Graded", hud.graded], ["Paved", hud.paved]].map(([l, v]) => (
-          <div key={l as string} className="mt-2">
-            <div className="flex justify-between"><span>{l}</span><span>{Math.floor((v as number) * 100)}%</span></div>
-            <div className="h-2 bg-muted"><div className="h-2 bg-primary" style={{ width: `${(v as number) * 100}%` }} /></div>
-          </div>
-        ))}
-        <div className="mt-3 text-xs text-muted-foreground">{(hud.speed * 3.6).toFixed(0)} km/h</div>
+        <div className="mt-1 flex items-baseline justify-between">
+          <span className="text-lg font-bold">{MACHINES[v.kind].label}</span>
+          <span className="text-xs text-muted-foreground">{(hud.speed * 3.6).toFixed(0)} km/h</span>
+        </div>
+        {hud.cargo && <div className="text-xs">{hud.cargo}</div>}
+        <ul className="mt-3 space-y-1">
+          {tasks.map(([l, val, ok]) => (
+            <li key={l} className="flex justify-between">
+              <span className={ok ? "text-muted-foreground line-through" : ""}>{l}</span><span>{val}</span>
+            </li>
+          ))}
+        </ul>
+        <div className="mt-2 h-2 bg-muted"><div className="h-2 bg-primary" style={{ width: `${hud.paved * 100}%` }} /></div>
       </div>
 
-      <div className="pointer-events-none absolute bottom-4 left-4 rounded-md bg-card/85 px-4 py-3 font-mono text-xs text-card-foreground">
-        <b>W/S</b> drive · <b>A/D</b> steer · <b>Tab</b> swap machine · <b>R</b> back to start
-        <div className="mt-1 text-muted-foreground">Dozer: push rocks, flatten bumps · Paver: pave graded dirt</div>
+      {(hud.action || hud.msg) && (
+        <div className="pointer-events-none absolute left-1/2 top-6 -translate-x-1/2 space-y-2 text-center font-mono text-sm">
+          {hud.msg && <div className="rounded-md bg-foreground px-4 py-2 text-background">{hud.msg}</div>}
+          {hud.action && (
+            <div className="rounded-md bg-card/90 px-4 py-2 text-card-foreground">
+              {hud.actionMax ? <><b>Hold Space</b> · {hud.action}</> : hud.action}
+              {hud.actionMax > 0 && hud.actionT > 0 && (
+                <div className="mt-1 h-1.5 bg-muted"><div className="h-1.5 bg-primary" style={{ width: `${Math.min(1, hud.actionT / hud.actionMax) * 100}%` }} /></div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="pointer-events-none absolute bottom-4 left-4 max-w-xl rounded-md bg-card/85 px-4 py-3 font-mono text-xs text-card-foreground">
+        <b>W/S</b> drive · <b>A/D</b> steer · <b>Space</b> work (hold) · <b>E</b> hop into nearby machine · <b>R</b> recover
+        <div className="mt-1 text-muted-foreground">
+          Bulldozer pushes small rocks off the road and flattens dirt · Excavator breaks boulders, digs mounds, loads the truck · Dump truck fills mud holes or dumps off-road · Paver paves flat dirt. Watch steep edges — loaded trucks tip easily and bog down in mud.
+        </div>
       </div>
 
-      {done && (
+      {hud.won && (
         <div className="absolute inset-0 flex items-center justify-center bg-foreground/40">
           <div className="rounded-md border-2 border-foreground bg-card p-8 text-center font-mono">
             <div className="text-2xl font-bold">Road complete!</div>
