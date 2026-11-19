@@ -1,6 +1,6 @@
 // Timber Ridge rules: restore the old logging road, then log the marked trees and haul them to the mill.
 // Pure data + functions: no React / three, same as world.ts.
-import { findCamp, type Camp } from "./camp";
+import { findCamp, type Camp } from "./campLayout";
 import { DIFF, addDamage, burnFuel, makeEnv, wearFactor, type Collider, type Difficulty, type Env, type Fx, type FxKind } from "./shared";
 import { CELL, HALF, N, fbm, hash, nearestOnPath, smooth, vnoise } from "./world";
 

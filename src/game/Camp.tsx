@@ -1,8 +1,8 @@
-// Draws the work camp laid out by camp.ts. Windows glow and floodlights come on when it gets dark.
+// Draws the work camp laid out by campLayout.ts. Windows glow and floodlights come on when it gets dark.
 import { useFrame } from "@react-three/fiber";
 import { useMemo, useRef } from "react";
 import * as THREE from "three";
-import type { Camp, CampProp } from "./camp";
+import type { Camp, CampProp } from "./campLayout";
 import { Glass, mat, useEnv } from "./parts";
 
 /** A flat sign face with text, drawn to a canvas texture. */

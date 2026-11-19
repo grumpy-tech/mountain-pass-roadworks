@@ -1,5 +1,5 @@
 // Pure game rules: terrain generation, road job state, vehicle sim. No React / three.
-import { findCamp, type Camp } from "./camp";
+import { findCamp, type Camp } from "./campLayout";
 import { DIFF, addDamage, burnFuel, makeEnv, wearFactor, type Difficulty, type Env, type Fx, type FxKind, LOW_FUEL } from "./shared";
 export const N = 80; // cells per side
 export const CELL = 2;
