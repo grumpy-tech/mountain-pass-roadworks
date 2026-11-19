@@ -18,7 +18,7 @@ function Terrain({ world }: { world: World }) {
     if (!world.dirtyTerrain) return;
     world.dirtyTerrain = false;
     recomputeHeights(world);
-    const pos = geo.attributes.position as THREE.BufferAttribute;
+    const pos = geo.getAttribute("position") as THREE.BufferAttribute;
     for (let v = 0; v < pos.count; v++) pos.setY(v, world.heights[v]);
     pos.needsUpdate = true;
     geo.computeVertexNormals();
