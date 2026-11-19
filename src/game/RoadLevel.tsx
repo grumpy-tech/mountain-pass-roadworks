@@ -28,6 +28,7 @@ function Terrain({ world }: { world: World }) {
     const pos = geo.getAttribute("position") as THREE.BufferAttribute;
     for (let v = 0; v < pos.count; v++) pos.setY(v, world.heights[v]);
     pos.needsUpdate = true;
+    (geo.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true; // washouts darken / dry out as they fill
     geo.computeVertexNormals();
   });
   return (
@@ -65,14 +66,19 @@ function RoadWork({ world }: { world: World }) {
   );
 }
 
-/** Dirt mounds, plus the road's mud holes (sunken puddle, mud rim, warning cone) and the off-road bog patches. */
+const GRAVEL_PER_WASHOUT = 7;
+
+/**
+ * Dirt mounds, the off-road bog patches, and the washouts. A washout is mostly terrain (the dip is carved into the
+ * ground by world.ts); here it only gets a puddle in the bottom, warning cones at the road edges and a spill of
+ * gravel, all of which shrink away as it is filled.
+ */
 function Hazards({ world }: { world: World }) {
   const mounds = useRef<THREE.InstancedMesh>(null!), bog = useRef<THREE.InstancedMesh>(null!);
-  const puddle = useRef<THREE.InstancedMesh>(null!), rim = useRef<THREE.InstancedMesh>(null!), cone = useRef<THREE.InstancedMesh>(null!), patch = useRef<THREE.InstancedMesh>(null!);
+  const puddle = useRef<THREE.InstancedMesh>(null!), cone = useRef<THREE.InstancedMesh>(null!), gravel = useRef<THREE.InstancedMesh>(null!);
   const moundCells = useMemo(() => world.road.filter((r) => r.kind === "mound"), [world]);
-  const holes = useMemo(() => world.road.filter((r) => r.kind === "mud"), [world]);
-  const bogCells = useMemo(() => world.mudCells.filter((c) => !holes.some((h) => h.cell === c)), [world, holes]);
-  const anim = useMemo(() => new Float32Array(holes.length), [holes]); // 0 = open hole, 1 = filled in
+  const washCells = useMemo(() => new Set(world.washouts.flatMap((wo) => wo.cells.map((k) => world.road[k].cell))), [world]);
+  const bogCells = useMemo(() => world.mudCells.filter((c) => !washCells.has(c)), [world, washCells]);
   const o = useMemo(() => new THREE.Object3D(), []);
   useEffect(() => {
     bogCells.forEach((c, i) => {
@@ -82,8 +88,7 @@ function Hazards({ world }: { world: World }) {
     });
     bog.current.instanceMatrix.needsUpdate = true;
   }, [world, bogCells, o]);
-  useFrame((_, delta) => {
-    const dt = Math.min(delta, 0.05);
+  useFrame(() => {
     if (world.dirtyHazards) {
       world.dirtyHazards = false;
       moundCells.forEach((r, i) => {
@@ -93,18 +98,23 @@ function Hazards({ world }: { world: World }) {
       });
       mounds.current.instanceMatrix.needsUpdate = true;
     }
-    holes.forEach((r, i) => {
-      if (r.kind !== "mud") anim[i] = Math.min(1, anim[i] + dt * 1.6);
-      const open = 1 - anim[i], y = heightAt(world, r.x, r.z);
-      o.rotation.set(0, i, 0);
-      o.position.set(r.x, y + 0.31, r.z); o.scale.set(open, 1, open); o.updateMatrix(); puddle.current.setMatrixAt(i, o.matrix);
-      o.position.set(r.x, y + 0.14, r.z); o.scale.set(1 - anim[i] * 0.3, 1 - anim[i] * 0.85, 1 - anim[i] * 0.3); o.updateMatrix(); rim.current.setMatrixAt(i, o.matrix);
-      o.position.set(r.x + 1.3, y + 0.05, r.z - 1.3); o.rotation.set(0, 0, 0); o.scale.setScalar(open); o.updateMatrix(); cone.current.setMatrixAt(i, o.matrix);
-      o.position.set(r.x, y + 0.1, r.z); o.rotation.set(0, i * 2, 0); o.scale.set(anim[i] * 1.2, 1, anim[i] * 1.2); o.updateMatrix(); patch.current.setMatrixAt(i, o.matrix);
+    world.washouts.forEach((wo, k) => {
+      const open = Math.max(0, 1 - wo.shown * 1.25), ux = Math.sin(wo.angle), uz = Math.cos(wo.angle), px = Math.cos(wo.angle), pz = -Math.sin(wo.angle);
+      o.rotation.set(0, wo.angle - Math.PI / 2, 0);
+      o.position.set(wo.x, heightAt(world, wo.x, wo.z) + 0.05, wo.z); o.scale.set(open * 3.1, 1, open * 1); o.updateMatrix(); puddle.current.setMatrixAt(k, o.matrix);
+      for (const e of [0, 1]) { // a cone at each end of the dip, just off the road
+        const a = (e ? 1 : -1) * (wo.len + 0.4), x = wo.x + ux * a + px * 1.6, z = wo.z + uz * a + pz * 1.6;
+        o.rotation.set(0, 0, 0); o.position.set(x, heightAt(world, x, z) + 0.45, z); o.scale.setScalar(open > 0.01 ? 1 : 0); o.updateMatrix(); cone.current.setMatrixAt(k * 2 + e, o.matrix);
+      }
+      for (let i = 0; i < GRAVEL_PER_WASHOUT; i++) { // washed-down gravel fanned out on the downhill side
+        const f = (i + 0.5) / GRAVEL_PER_WASHOUT, a = (f - 0.5) * 2 * (wo.len - 0.6), side = 1.3 + ((i * 7) % 5) * 0.28;
+        const x = wo.x + ux * a + px * side, z = wo.z + uz * a + pz * side, sc = (0.22 + ((i * 3) % 4) * 0.08) * (open > 0.01 ? 1 : 0);
+        o.rotation.set(i, i * 2.1, 0); o.position.set(x, heightAt(world, x, z) + sc * 0.5, z); o.scale.set(sc * 1.4, sc, sc * 1.1); o.updateMatrix(); gravel.current.setMatrixAt(k * GRAVEL_PER_WASHOUT + i, o.matrix);
+      }
     });
-    for (const m of [puddle, rim, cone, patch]) m.current.instanceMatrix.needsUpdate = true;
+    for (const m of [puddle, cone, gravel]) m.current.instanceMatrix.needsUpdate = true;
   });
-  const nHoles = Math.max(1, holes.length);
+  const nWash = Math.max(1, world.washouts.length);
   return (
     <>
       <instancedMesh ref={mounds} args={[undefined, undefined, Math.max(1, moundCells.length)]} castShadow receiveShadow>
@@ -113,17 +123,14 @@ function Hazards({ world }: { world: World }) {
       <instancedMesh ref={bog} args={[undefined, undefined, Math.max(1, bogCells.length)]} frustumCulled={false}>
         <boxGeometry args={[CELL * 1.05, 0.06, CELL * 1.05]} /><meshStandardMaterial color="#6e5a3f" roughness={0.6} />
       </instancedMesh>
-      <instancedMesh ref={puddle} args={[undefined, undefined, nHoles]} frustumCulled={false}>
-        <cylinderGeometry args={[1.3, 1.3, 0.06, 10]} /><meshStandardMaterial color="#120b07" roughness={0.04} metalness={0.7} />
+      <instancedMesh ref={puddle} args={[undefined, undefined, nWash]} frustumCulled={false}>
+        <cylinderGeometry args={[1, 1, 0.06, 9]} /><meshStandardMaterial color="#4a3826" roughness={0.12} metalness={0.25} />
       </instancedMesh>
-      <instancedMesh ref={rim} args={[undefined, undefined, nHoles]} frustumCulled={false} castShadow>
-        <cylinderGeometry args={[1.55, 1.95, 0.3, 10]} /><meshStandardMaterial color="#5a4128" roughness={1} flatShading />
-      </instancedMesh>
-      <instancedMesh ref={cone} args={[undefined, undefined, nHoles]} frustumCulled={false} castShadow>
+      <instancedMesh ref={cone} args={[undefined, undefined, nWash * 2]} frustumCulled={false} castShadow>
         <coneGeometry args={[0.32, 0.9, 6]} /><meshStandardMaterial color="#ff6a1a" flatShading />
       </instancedMesh>
-      <instancedMesh ref={patch} args={[undefined, undefined, nHoles]} frustumCulled={false} receiveShadow>
-        <cylinderGeometry args={[1.5, 1.6, 0.14, 9]} /><meshStandardMaterial color="#8a6a45" roughness={1} flatShading />
+      <instancedMesh ref={gravel} args={[undefined, undefined, nWash * GRAVEL_PER_WASHOUT]} frustumCulled={false} castShadow>
+        <dodecahedronGeometry args={[1, 0]} /><meshStandardMaterial color="#8a8378" flatShading />
       </instancedMesh>
     </>
   );
@@ -360,8 +367,8 @@ const WEIGHT: Record<Machine, number> = { dozer: 0.9, excavator: 0.8, truck: 0.6
 const LAMP: Record<Machine, [number, number, number, number]> = { dozer: [0, 1.3, 1.1, 0.55], excavator: [-0.45, 2.45, 0.8, 0.3], truck: [0, 1.1, 2.4, 0.7], paver: [0, 1.3, 1.1, 0.7] };
 const ROLES: Record<Machine, string> = {
   dozer: "pushes small rocks off the road and grades dirt flat.",
-  excavator: "breaks boulders, digs mounds, fills mud holes (needs dirt from a mound first), loads the truck.",
-  truck: "tips dirt into mud holes or dumps loads off-road.",
+  excavator: "breaks boulders, digs mounds, fills washouts (needs dirt: from a mound, or scooped beside the road), loads the truck.",
+  truck: "tips dirt into washouts (back the tailgate over the dip) or dumps loads off-road.",
   paver: "lays asphalt on graded dirt.",
 };
 
@@ -379,7 +386,7 @@ export default function RoadLevel(props: LevelProps) {
       game,
       machines: Object.fromEntries((Object.keys(MACHINES) as Machine[]).map((k) => [k, { ...MACHINES[k], weight: WEIGHT[k], paint: PAINT[k], lamp: LAMP[k] }])),
       roles: ROLES,
-      jobOrder: "1. Clear boulders, rocks and dirt mounds. 2. Fill each mud hole: dig dirt from a mound with the excavator, then hold Space with the hole in front of the bucket. 3. Drive the bulldozer over the road to grade it. 4. Drive the paver over graded dirt. Flags show how far the graded and paved stretches reach. Watch steep edges: loaded trucks tip easily and bog down in mud.",
+      jobOrder: "1. Clear boulders, rocks and dirt mounds. 2. Fill each washout (a dip across the road, 3 loads of dirt each): scoop dirt from a mound with the excavator, then hold Space with the bucket over the dip, or load the truck and back its tailgate over the dip. 3. Drive the bulldozer over the road to grade it. 4. Drive the paver over graded dirt. Flags show how far the graded and paved stretches reach. Watch steep edges: loaded trucks tip easily and bog down in mud.",
       winText: "The pass is open.",
       par: 660,
       penalties: () => 0,
@@ -393,14 +400,14 @@ export default function RoadLevel(props: LevelProps) {
       progress: () => progress(world).paved,
       cargo: () => {
         const v = game.vehicles[game.active];
-        return v.kind === "truck" ? `Load ${v.dirt + v.rock}/${TRUCK_CAPACITY} (${v.dirt} dirt, ${v.rock} rock)` : v.kind === "excavator" ? (v.dirt ? "Bucket: dirt (find a mud hole)" : v.rock ? "Bucket: rock" : "Bucket: empty") : "";
+        return v.kind === "truck" ? `Load ${v.dirt + v.rock}/${TRUCK_CAPACITY} (${v.dirt} dirt, ${v.rock} rock)` : v.kind === "excavator" ? (v.dirt ? "Bucket: dirt (find a washout)" : v.rock ? "Bucket: rock" : "Bucket: empty") : "";
       },
       tasks: () => {
         const p = progress(world), f = roadFrontier(world);
         return [
           ["Rocks off the road", p.rocksOnRoad ? `${p.rocksOnRoad} left` : "done", !p.rocksOnRoad],
           ["Dirt mounds dug", p.mounds ? `${p.mounds} left` : "done", !p.mounds],
-          ["Mud holes filled", p.mud ? `${p.mud} left` : "done", !p.mud],
+          ["Washouts filled", p.washouts ? `${p.washouts} left` : "done", !p.washouts],
           ["Graded", `${Math.floor(p.graded * 100)}% · ${Math.round(f.graded.m)} m`, p.graded > 0.95],
           ["Paved", `${Math.floor(p.paved * 100)}% · ${Math.round(f.paved.m)} m`, p.paved >= 0.95],
         ];
@@ -418,7 +425,8 @@ export default function RoadLevel(props: LevelProps) {
           segs.push({ x1: a.x, z1: a.z, x2: b.x, z2: b.z, color: blocked[c] && stage[c] < 3 ? "#d1493b" : stage[c] >= 3 ? "#9aa0a8" : stage[c] === 2 ? "#e0c28c" : "#8a6a45" });
         }
         const end = world.path[world.path.length - 1], pump = world.camp.fuel;
-        return { segs, pins: [{ x: world.camp.x, z: world.camp.z, color: "#f2c230", label: "C" }, { x: pump.x, z: pump.z, color: "#ff8a3d", label: "F" }, { x: end.x, z: end.z, color: "#ffffff", label: "S" }] };
+        const washouts = world.washouts.filter((wo) => wo.filled < wo.cells.length).map((wo) => ({ x: wo.x, z: wo.z, color: "#ff6a1a", label: "", r: 4 }));
+        return { segs, pins: [{ x: world.camp.x, z: world.camp.z, color: "#f2c230", label: "C" }, { x: pump.x, z: pump.z, color: "#ff8a3d", label: "F" }, { x: end.x, z: end.z, color: "#ffffff", label: "S" }, ...washouts] };
       },
       scene: (
         <>
