@@ -81,6 +81,8 @@ export interface Site {
   toppedOut: boolean;
   // foundation
   pitCells: number[]; dug: Set<number>; hauled: number;
+  /** Original ground colour of pit vertices, so digging can darken them without compounding. */
+  groundColor: Map<number, [number, number, number]>;
   // run stats
   time: number; damage: number; exposure: number; traffic: number;
   wind: { x: number; z: number };
@@ -103,7 +105,7 @@ export function createSite(cfg: SiteConfig): Site {
     loadId: null, pallets: [], nextPalletId: 1, trucks: [], nextTruckId: 1,
     nextDelivery: 0, redeliver: [],
     nextBuild: 0, floorsDone: 0, frameUp: false, roofDone: false, cure: null, toppedOut: false,
-    pitCells, dug: new Set(), hauled: 0,
+    pitCells, dug: new Set(), hauled: 0, groundColor: new Map(),
     time: 0, damage: 0, exposure: 0, traffic: 0,
     wind: { x: 0, z: 0 }, notes: [], cooldown: { building: 0, power: 0 },
   };
@@ -133,6 +135,14 @@ export function digCell(w: World, s: Site, cell: number) {
     for (const [di, dj] of [[0, 0], [1, 0], [0, 1], [1, 1]]) w.dig[(j + dj) * (N + 1) + (i + di)] += s.cfg.pitDepth / 4;
   }
   recomputeHeights(w); // physics reads w.heights directly; the renderer only needs the dirty flag
+  // freshly dug soil is darker, so the pit reads from above
+  for (let v = 0; v < w.dig.length; v++) {
+    if (w.dig[v] <= 0) continue;
+    let orig = s.groundColor.get(v);
+    if (!orig) { orig = [w.colors[v * 3], w.colors[v * 3 + 1], w.colors[v * 3 + 2]]; s.groundColor.set(v, orig); }
+    const f = 1 - 0.4 * Math.min(1, w.dig[v] / s.cfg.pitDepth);
+    for (let k = 0; k < 3; k++) w.colors[v * 3 + k] = orig[k] * f * (k === 2 ? 0.95 : 1);
+  }
   w.dirtyTerrain = true;
 }
 
