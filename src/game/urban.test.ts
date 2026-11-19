@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { URBAN_LEVEL, URBAN_SITE } from "./levels/urban";
 import { PALLETS, cellCenter, craneHint, foundationDone, hookedPallet, stars, structureTop, toggleHook, type Pallet, type Site } from "./site";
-import { createGame, craneAction, currentAction, heightAt, recover, stepGame, switchVehicle, type Game } from "./world";
+import { createGame, craneAction, currentAction, heightAt, recover, stepGame, switchVehicle, type Game } from "./urbanSim";
 
 const idle = { throttle: 0, steer: 0, action: false };
 const run = (g: Game, secs: number) => { for (let t = 0; t < secs; t += 1 / 60) stepGame(g, idle, 1 / 60); };

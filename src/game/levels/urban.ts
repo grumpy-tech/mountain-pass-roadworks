@@ -2,7 +2,7 @@
 // south side, a foundation pit to dig, and a tower crane that lifts every delivery onto the rising building.
 import { CELL, HALF, N, hash, recomputeHeights, type World } from "../grid";
 import { createSite, inRect, type DeliveryItem, type Rect, type SiteConfig } from "../site";
-import { spawnVehicle, type LevelConfig } from "../world";
+import { spawnVehicle, type LevelConfig } from "../urbanSim";
 
 const FLOORS = 6;
 

@@ -1,6 +1,6 @@
 // Snapshot of site state for the HUD, sampled by Game.tsx a few times a second.
 import { PALLETS, craneHint, foundationDone, hookedPallet, stars } from "./site";
-import type { Game } from "./world";
+import type { Game } from "./urbanSim";
 
 export interface SiteHud {
   dug: number; hauled: number; total: number;
