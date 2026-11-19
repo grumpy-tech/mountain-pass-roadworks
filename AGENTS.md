@@ -28,3 +28,6 @@ use the editor.
   own key and store it in Secrets.
 - **Secrets.** Lovable manages them. Do not put secret values in the repo.
 <!-- LOVABLE:END -->
+
+## Game architecture
+- Game rules (terrain, road job stages, vehicle sim) live in `src/game/world.ts` with no React/three imports; `src/game/Game.tsx` only renders that state and runs one `useFrame` stepper — keeps the sim testable and tweakable.
