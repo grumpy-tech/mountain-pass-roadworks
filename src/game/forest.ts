@@ -14,6 +14,11 @@ export const FOREST_MACHINES: Record<ForestMachine, { accel: number; max: number
 
 export const LOG_TARGET = 18; // marked trees in the cut block; the truck holds 6, so three loads
 export const SKIDDER_CAPACITY = 3;
+export const LOG_LENGTH = 4; // metres; also what the renderer draws
+export const HITCH_BACK = 3.2; // the claw hangs this far behind the skidder's centre
+const HITCH_SPREAD = [0, -0.78, 0.78]; // each carried log is clamped this far to the side of the claw's centre line
+const GRAB_TIME = 0.45; // s for a hooked log to slide its end into the claw
+const SWING_IN = 2.6; // rad/s: a log that ends up ahead of the claw (hooked from the front) swings round to trail behind
 export const TRUCK_CAPACITY = 6;
 export const WASTE_ALLOWANCE = 6; // unmarked trees you may fell (to clear a path) before it costs a star
 export const FALL_TIME = 1.15; // seconds for a felled tree to hit the ground
@@ -56,6 +61,11 @@ export interface Log { id: number; x: number; z: number; heading: number; at: nu
 export interface Deadfall { id: number; x: number; z: number; heading: number; cleared: boolean }
 export interface RoadCell { cell: number; x: number; z: number; t: number; rut: number }
 export interface Zone { x: number; z: number; r: number }
+/**
+ * A log towed by the skidder like a trailer: its front end (f) is held by the claw, its tail (t) swings freely
+ * behind and is dragged round corners. (a) is where the front end was when hooked, so it slides into the claw.
+ */
+export interface DragLog { tx: number; tz: number; fx: number; fz: number; ax: number; az: number; g: number; sw?: boolean }
 export interface FieldTank extends Zone { fuel: number; heading: number } // fuel: 1 = one full machine tank
 export type TankerState = "depot" | "out" | "fill" | "back";
 /** The NPC tanker: hidden at the depot, drives out along the road to the field tank, pumps, and drives back. */
@@ -80,6 +90,7 @@ export interface ForestVehicle {
   kind: ForestMachine; x: number; y: number; z: number; heading: number; speed: number; pitch: number; roll: number;
   tipped: boolean; work: number;
   logs: number; // skidder grapple / truck bed
+  drag: DragLog[]; // one per log the skidder carries (kept in step with `logs`)
   fuel: number; damage: number;
 }
 
@@ -290,7 +301,7 @@ function treeNear(w: ForestWorld, x: number, z: number, reach: number): number {
 
 function makeVehicle(w: ForestWorld, kind: ForestMachine, slot: StartSlot): ForestVehicle {
   const { x, z, heading } = slot;
-  return { kind, x, y: forestHeightAt(w, x, z), z, heading, speed: 0, pitch: 0, roll: 0, tipped: false, work: 0, logs: 0, fuel: 1, damage: 0 };
+  return { kind, x, y: forestHeightAt(w, x, z), z, heading, speed: 0, pitch: 0, roll: 0, tipped: false, work: 0, logs: 0, drag: [], fuel: 1, damage: 0 };
 }
 
 export function createForestGame(diff: Difficulty = "normal"): ForestGame {
@@ -327,6 +338,43 @@ function grip(w: ForestWorld, v: ForestVehicle) {
   if (v.kind === "feller") return road ? 0.9 - 0.2 * rut : 0.7;
   if (v.kind === "logtruck") return road ? 1 - 0.35 * rut : v.logs > 0 ? 0.3 : 0.4; // the truck bogs down off the haul road
   return road ? 1 - 0.3 * rut : 0.75;
+}
+
+/** Where log `i` is clamped by the claw (behind the skidder). */
+export function hitchPoint(v: { x: number; z: number; heading: number }, i: number) {
+  const f = Math.sin(v.heading), c = Math.cos(v.heading), o = HITCH_SPREAD[i] ?? 0;
+  return { x: v.x - f * HITCH_BACK + c * o, z: v.z - c * HITCH_BACK - f * o };
+}
+
+/** Keep one DragLog per carried log; a log that just appeared hangs straight behind the claw. */
+function syncDrag(v: ForestVehicle) {
+  if (v.drag.length > v.logs) v.drag.length = v.logs;
+  while (v.drag.length < v.logs) {
+    const h = hitchPoint(v, v.drag.length);
+    v.drag.push({ tx: h.x - Math.sin(v.heading) * LOG_LENGTH, tz: h.z - Math.cos(v.heading) * LOG_LENGTH, fx: h.x, fz: h.z, ax: h.x, az: h.z, g: 1 });
+  }
+}
+
+/** Trailer kinematics: the front end follows the claw, the tail keeps its distance and trails along behind it. */
+function stepDrag(v: ForestVehicle, dt: number) {
+  syncDrag(v);
+  v.drag.forEach((d, i) => {
+    const h = hitchPoint(v, i);
+    d.g = Math.min(1, d.g + dt / GRAB_TIME);
+    const e = d.g * d.g * (3 - 2 * d.g);
+    d.fx = d.ax + (h.x - d.ax) * e; d.fz = d.az + (h.z - d.az) * e;
+    let dx = d.fx - d.tx, dz = d.fz - d.tz;
+    const len = Math.hypot(dx, dz);
+    if (len > 1e-3) { dx /= len; dz /= len; } else { dx = Math.sin(v.heading); dz = Math.cos(v.heading); }
+    const phi = Math.atan2(Math.sin(v.heading - Math.atan2(dx, dz)), Math.cos(v.heading - Math.atan2(dx, dz))); // angle from the log's direction to the machine's
+    if (Math.cos(phi) < 0.3) d.sw = true; // tail is ahead of / beside the claw: swing it round behind, until it is lined up
+    else if (Math.cos(phi) > 0.97) d.sw = false;
+    if (d.sw) {
+      const hd = Math.atan2(dx, dz) + Math.max(-SWING_IN * dt, Math.min(SWING_IN * dt, phi));
+      dx = Math.sin(hd); dz = Math.cos(hd);
+    }
+    d.tx = d.fx - dx * LOG_LENGTH; d.tz = d.fz - dz * LOG_LENGTH;
+  });
 }
 
 function stepVehicle(g: ForestGame, v: ForestVehicle, throttle: number, steer: number, dt: number, me: boolean) {
@@ -389,6 +437,7 @@ function stepVehicle(g: ForestGame, v: ForestVehicle, throttle: number, steer: n
     }
   }
   v.y += ((hf + hb + hl + hr) / 4 - v.y) * (1 - Math.exp(-10 * dt));
+  if (v.kind === "skidder") stepDrag(v, dt);
 
   // the grader levels the ruts it drives over
   if (v.kind === "grader" && !v.tipped && Math.abs(v.speed) > 0.4) {
@@ -477,11 +526,18 @@ export function currentForestAction(g: ForestGame): Action {
       } };
     }
     if (v.logs >= SKIDDER_CAPACITY) return { label: "Grapple full: take logs to the landing", time: Infinity, run: () => {} };
+    // a log can be hooked from the front of the machine or from the claw at the back
     let best = -1, bd = 3.4;
-    w.logs.forEach((l, i) => { const d = dist2(l, { x: px, z: pz }); if (l.at <= g.time && d < bd) { bd = d; best = i; } });
+    const claw = hitchPoint(v, v.logs);
+    w.logs.forEach((l, i) => { const d = Math.min(dist2(l, { x: px, z: pz }), dist2(l, claw)); if (l.at <= g.time && d < bd) { bd = d; best = i; } });
     if (best < 0) return null;
     return { label: "Hook log", time: HOOK_TIME, run: () => {
+      syncDrag(v);
+      const l = w.logs[best], h = hitchPoint(v, v.drag.length), dx = Math.sin(l.heading) * LOG_LENGTH / 2, dz = Math.cos(l.heading) * LOG_LENGTH / 2;
+      const e1 = { x: l.x + dx, z: l.z + dz }, e2 = { x: l.x - dx, z: l.z - dz };
+      const [near, far] = dist2(e1, h) <= dist2(e2, h) ? [e1, e2] : [e2, e1]; // the claw grabs the end of the log nearest to it
       w.logs.splice(best, 1); v.logs++; w.dirtyLogs = true; emit(g, "hook");
+      v.drag.push({ tx: far.x, tz: far.z, fx: near.x, fz: near.z, ax: near.x, az: near.z, g: 0 });
     } };
   }
   // log truck: loads itself from the landing stack with its crane
@@ -632,7 +688,7 @@ export function forestHint(g: ForestGame): { text: string; machine: ForestMachin
   if (w.logs.length > 0 || skidder.logs > 0) {
     return skidder.logs > 0
       ? { text: "Take the logs to the landing (the grey clearing)", machine: "skidder" }
-      : { text: `Skid ${w.logs.length} log${w.logs.length > 1 ? "s" : ""} to the landing: hold Space beside a log`, machine: "skidder" };
+      : { text: `Skid ${w.logs.length} log${w.logs.length > 1 ? "s" : ""} to the landing: hold Space with the front or the claw beside a log`, machine: "skidder" };
   }
   if (w.landing.stack > 0 && truck.logs < TRUCK_CAPACITY) return { text: "Back the truck into the landing and load the stack", machine: "logtruck" };
   if (truck.logs > 0) return { text: "Haul the load down the road to the mill gate", machine: "logtruck" };

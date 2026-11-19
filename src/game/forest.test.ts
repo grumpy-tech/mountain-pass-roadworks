@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  FALL_TIME, LOG_TARGET, OPEN_AT, SKIDDER_CAPACITY, TRUCK_CAPACITY, blockersLeft, blockersTotal, createForestGame, currentForestAction, cycleForestVehicle, forestHint,
-  pathPoint, recoverForest, roadLevelled, selectForestVehicle, stepForestGame, tankerEta, type ForestGame, type ForestMachine, type ForestVehicle,
+  FALL_TIME, LOG_LENGTH, LOG_TARGET, OPEN_AT, SKIDDER_CAPACITY, TRUCK_CAPACITY, blockersLeft, blockersTotal, createForestGame, currentForestAction, cycleForestVehicle, forestHint,
+  hitchPoint, pathPoint, recoverForest, roadLevelled, selectForestVehicle, stepForestGame, tankerEta, type ForestGame, type ForestMachine, type ForestVehicle,
 } from "./forest";
 import { nearestOnPath } from "./world";
 
@@ -307,5 +307,70 @@ describe("forest level", () => {
     place(blocker, 0, 0); // machine moves away: it carries on
     hold(g, 1, false);
     expect(w.tanker.s).toBeGreaterThan(stuck + 4);
+  });
+  it("the skidder tows up to 3 logs like a trailer: claw holds one end, the tail swings behind", () => {
+    const g = createForestGame(), w = g.world, s = drive(g, "skidder");
+    for (let i = 0; i < 4; i++) w.logs.push({ id: i, x: 0, z: 0, heading: 0.3 * i, at: 0 });
+    place(s, 0, -3);
+    hold(g, 6);
+    expect(s.logs).toBe(3);
+    expect(s.drag).toHaveLength(3);
+    expect(w.logs).toHaveLength(1); // the fourth stays on the ground: grapple full
+    hold(g, 1, false); // let the logs finish sliding into the claw
+    s.drag.forEach((d, i) => {
+      const h = hitchPoint(s, i);
+      expect(Math.hypot(d.fx - h.x, d.fz - h.z)).toBeLessThan(0.01); // the claw is at the front end of every log
+      expect(Math.hypot(d.fx - d.tx, d.fz - d.tz)).toBeCloseTo(LOG_LENGTH, 3); // a rigid log
+    });
+    // drive a tight turn (moved by hand so trees can't get in the way): the tails lag behind the turning machine
+    const roll = (steps: number, turn: number) => {
+      for (let i = 0; i < steps; i++) {
+        s.heading += turn * 0.05; s.x += Math.sin(s.heading) * 0.2; s.z += Math.cos(s.heading) * 0.2;
+        stepForestGame(g, { throttle: 0, steer: 0, action: false }, 0.05);
+      }
+    };
+    const angleOff = () => { const d = s.drag[0]; let a = Math.atan2(d.fx - d.tx, d.fz - d.tz) - s.heading; a = Math.atan2(Math.sin(a), Math.cos(a)); return a; };
+    roll(25, 1.2);
+    expect(Math.abs(angleOff())).toBeGreaterThan(0.1); // the log is not lined up with the machine: it pivots on the claw
+    s.drag.forEach((q) => expect(Math.hypot(q.fx - q.tx, q.fz - q.tz)).toBeCloseTo(LOG_LENGTH, 3));
+    roll(200, 0); // straight again: the logs trail in line behind it
+    expect(Math.abs(angleOff())).toBeLessThan(0.1);
+  });
+
+  it("the claw grabs the end of the log nearest to it, and can hook from behind the machine", () => {
+    const g = createForestGame(), w = g.world, s = drive(g, "skidder");
+    w.logs.push({ id: 0, x: 20, z: 24, heading: 0, at: 0 }); // lying along z: ends at z=22 and z=26
+    place(s, 20, 18.8, Math.PI); // facing -z, so its claw (3.2 behind) hangs over the log's z=22 end
+    const claw = hitchPoint(s, 0);
+    expect(Math.hypot(claw.x - 20, claw.z - 22)).toBeLessThan(0.5);
+    expect(currentForestAction(g)?.label).toBe("Hook log");
+    hold(g, 1);
+    expect(s.drag).toHaveLength(1);
+    expect(Math.hypot(s.drag[0].ax - 20, s.drag[0].az - 22)).toBeLessThan(0.01); // clamped at the near end
+    expect(Math.hypot(s.drag[0].tx - 20, s.drag[0].tz - 26)).toBeLessThan(0.01); // the far end trails behind it
+  });
+
+  it("a log hooked from the front swings round to trail behind the claw", () => {
+    const g = createForestGame(), w = g.world, s = drive(g, "skidder");
+    w.logs.push({ id: 0, x: 20, z: 24, heading: 0, at: 0 }); // lying ahead of the machine, along its heading
+    place(s, 20, 20, 0);
+    hold(g, 1);
+    expect(s.drag).toHaveLength(1);
+    hold(g, 3, false);
+    const d = s.drag[0], f = { x: Math.sin(s.heading), z: Math.cos(s.heading) };
+    expect((d.fx - d.tx) * f.x + (d.fz - d.tz) * f.z).toBeGreaterThan(LOG_LENGTH * 0.9); // tail is now behind the front end, in line
+    expect(Math.hypot(d.fx - d.tx, d.fz - d.tz)).toBeCloseTo(LOG_LENGTH, 3);
+  });
+
+  it("drops the towed logs at the landing", () => {
+    const g = createForestGame(), w = g.world, s = drive(g, "skidder");
+    s.logs = 2; hold(g, 0.1, false);
+    expect(s.drag).toHaveLength(2);
+    place(s, w.landing.x, w.landing.z);
+    hold(g, 1);
+    expect(s.logs).toBe(0);
+    hold(g, 0.1, false);
+    expect(s.drag).toHaveLength(0);
+    expect(w.landing.stack).toBe(2);
   });
 });

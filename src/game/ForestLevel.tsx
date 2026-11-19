@@ -3,7 +3,7 @@ import { useContext, useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import CampScene, { Label } from "./Camp";
 import {
-  FALL_TIME, FOREST_MACHINES, LOG_TARGET, OPEN_AT, SKIDDER_CAPACITY, TRUCK_CAPACITY, WASTE_ALLOWANCE, blockersLeft, blockersTotal, createForestGame, currentForestAction,
+  FALL_TIME, FOREST_MACHINES, LOG_LENGTH, LOG_TARGET, OPEN_AT, SKIDDER_CAPACITY, TRUCK_CAPACITY, WASTE_ALLOWANCE, blockersLeft, blockersTotal, createForestGame, currentForestAction,
   cycleForestVehicle, forestHeightAt, forestHint, forestProgress, pathPoint, recomputeForestHeights, recoverForest, roadLevelled, selectForestVehicle, stepForestGame, tankerEta,
   type ForestMachine, type ForestVehicle, type ForestWorld, type ForestGame,
 } from "./forest";
@@ -139,7 +139,8 @@ function FallingTrees({ bus, world }: { bus: FxBus; world: ForestWorld }) {
   );
 }
 
-const LOG_R = 0.38, LOG_LEN = 4;
+const LOG_R = 0.38, LOG_LEN = LOG_LENGTH;
+const CLAW_H = 0.9; // height of the claw (and the front end of each towed log) above the ground
 
 /** Felled logs (visible once they have landed), deadfalls across the road, and the pile at the landing. */
 function Logs({ game }: { game: ForestGame }) {
@@ -192,6 +193,34 @@ function Logs({ game }: { game: ForestGame }) {
         <cylinderGeometry args={[LOG_R, LOG_R, LOG_LEN, 7]} />{mat("#9a6632")}
       </instancedMesh>
     </>
+  );
+}
+
+/** Logs the skidder is towing: gripped by the claw at one end, the other end trailing on the ground and swinging round corners. */
+function DraggedLogs({ game }: { game: ForestGame }) {
+  const world = game.world, mesh = useRef<THREE.InstancedMesh>(null!);
+  const o = useMemo(() => new THREE.Object3D(), []);
+  const up = useMemo(() => new THREE.Vector3(0, 1, 0), []), dir = useMemo(() => new THREE.Vector3(), []);
+  useFrame(() => {
+    const skidder = game.vehicles.find((v) => v.kind === "skidder")!;
+    for (let i = 0; i < SKIDDER_CAPACITY; i++) {
+      const d = skidder.drag[i];
+      if (!d || i >= skidder.logs) { o.scale.setScalar(0); o.updateMatrix(); mesh.current.setMatrixAt(i, o.matrix); continue; }
+      const fy = forestHeightAt(world, d.fx, d.fz) + CLAW_H, ty = forestHeightAt(world, d.tx, d.tz) + LOG_R; // front end lifted in the claw, tail on the ground
+      dir.set(d.fx - d.tx, fy - ty, d.fz - d.tz);
+      const len = dir.length() || 1;
+      dir.divideScalar(len);
+      o.position.set((d.fx + d.tx) / 2, (fy + ty) / 2, (d.fz + d.tz) / 2);
+      o.quaternion.setFromUnitVectors(up, dir);
+      o.scale.set(1, len / LOG_LEN, 1);
+      o.updateMatrix(); mesh.current.setMatrixAt(i, o.matrix);
+    }
+    mesh.current.instanceMatrix.needsUpdate = true;
+  });
+  return (
+    <instancedMesh ref={mesh} args={[undefined, undefined, SKIDDER_CAPACITY]} castShadow frustumCulled={false}>
+      <cylinderGeometry args={[LOG_R, LOG_R * 0.85, LOG_LEN, 7]} />{mat("#8b5a2b")}
+    </instancedMesh>
   );
 }
 
@@ -398,7 +427,7 @@ function ForestVehicleMesh({ v, active, night }: { v: ForestVehicle; active: boo
     g.current.rotation.set(0, 0, 0);
     g.current.rotateY(v.heading); g.current.rotateX(v.pitch); g.current.rotateZ(v.roll);
     const t = clock.elapsedTime;
-    if (arm.current) arm.current.rotation.x = v.kind === "feller" ? 0.1 + v.work * 0.35 : v.work * 0.4 + Math.sin(t * 5) * 0.08 * v.work; // felling head / grapple dips to the work
+    if (arm.current) arm.current.rotation.x = v.kind === "feller" ? 0.1 + v.work * 0.35 : v.logs > 0 ? 0 : v.work * 0.4 + Math.sin(t * 5) * 0.08 * v.work; // felling head / grapple dips to the work (but holds still while towing)
     if (saw.current) saw.current.rotation.x += delta * (2 + v.work * 40);
     if (blade.current) blade.current.rotation.x = Math.sin(t * 8) * 0.025 * Math.min(1, Math.abs(v.speed) / 3);
     if (crane.current) crane.current.rotation.y = Math.sin(t * 3) * 0.9 * v.work; // the truck crane swings logs aboard
@@ -479,15 +508,12 @@ function ForestVehicleMesh({ v, active, night }: { v: ForestVehicle; active: boo
           <Lamp p={[-0.5, 1.3, 1.81]} s={[0.28, 0.2, 0.06]} on={on} color="#fff3c4" />
           <Stack p={[0.55, 2.1, 1.7]} h={0.9} />
           <Beacon p={[0, 2.47, 0.7]} on={active} />
-          <group ref={arm} position={[0, 1.8, -2.0]}>
-            <mesh position={[0, 0.2, -0.9]} rotation={[0.5, 0, 0]} castShadow><boxGeometry args={[0.3, 0.3, 2]} />{mat("#222")}</mesh>
-            <mesh position={[0, -0.5, -1.7]} castShadow><boxGeometry args={[1.1, 0.2, 0.35]} />{mat("#555")}</mesh>
+          {/* grapple: a boom sloping down behind the cab to a claw that clamps the front end of the towed logs */}
+          <group ref={arm} position={[0, 1.8, -2.1]}>
+            <mesh position={[0, -0.45, -0.55]} rotation={[-0.69, 0, 0]} castShadow><boxGeometry args={[0.3, 0.3, 1.45]} />{mat("#222")}</mesh>
+            <mesh position={[0, -0.45, -1.1]} castShadow><boxGeometry args={[2.5, 0.16, 0.28]} />{mat("#555")}</mesh>
+            {[-1.25, 1.25, -0.4, 0.4].map((x) => <mesh key={x} position={[x, -0.7, -1.1]} castShadow><boxGeometry args={[0.12, 0.65, 0.3]} />{mat("#555")}</mesh>)}
           </group>
-          {[-0.45, 0.45, 0].map((x, i) => (
-            <mesh key={i} ref={slot(slots, i)} position={[x, 0.45 + (i === 2 ? 0.6 : 0), -3.6]} rotation={[Math.PI / 2, 0, 0]} castShadow>
-              <cylinderGeometry args={[LOG_R, LOG_R, LOG_LEN, 7]} />{mat("#8b5a2b")}
-            </mesh>
-          ))}
         </>
       )}
       {v.kind === "logtruck" && (
@@ -531,7 +557,7 @@ const LAMP: Record<ForestMachine, [number, number, number, number]> = { feller: 
 const ROLES: Record<ForestMachine, string> = {
   feller: "saws trees down: blockers on the old road first, then only the marked trees in the cut block count.",
   grader: "levels the ruts just by driving along the old road. Slow going over rough ground.",
-  skidder: "drags fallen deadfall logs off the road, hooks felled logs and hauls them to the landing.",
+  skidder: "drags fallen deadfall logs off the road, clamps up to 3 felled logs in its rear claw and tows them to the landing. The logs trail behind like a trailer, so take corners wide.",
   logtruck: "loads the stack at the landing with its crane, then hauls it to the sawmill. Needs the restored road: it bogs down in the forest.",
 };
 const CHUNKS = 48;
@@ -632,6 +658,7 @@ function ForestScene({ game }: { game: ForestGame }) {
       <Trees world={world} />
       <FallingTrees bus={bus} world={world} />
       <Logs game={game} />
+      <DraggedLogs game={game} />
       <Landmarks world={world} />
       <RoadFlags world={world} />
       <FieldTankMesh world={world} />
