@@ -2,6 +2,7 @@ import { useFrame } from "@react-three/fiber";
 import { useContext, useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import CampScene, { Label } from "./Camp";
+import GroundMarks from "./GroundMarks";
 import { Beacon, Glass, Lamp, PAINT, Stack, Tracks, Wheels, mat } from "./parts";
 import { FxCtx, emitAt } from "./Particles";
 import { LevelShell, type BaseVehicle, type LevelProps, type LevelSpec } from "./Shell";
@@ -427,6 +428,7 @@ export default function RoadLevel(props: LevelProps) {
           <Rocks world={world} />
           <Scenery world={world} />
           <CampScene camp={world.camp} hy={(x, z) => heightAt(world, x, z)} />
+          <GroundMarks machines={game.vehicles} heightAt={(x, z) => heightAt(world, x, z)} />
           <FrontierFlag world={world} which="graded" />
           <FrontierFlag world={world} which="paved" />
           <DistancePosts world={world} />

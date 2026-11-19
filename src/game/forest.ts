@@ -31,9 +31,22 @@ const TIP_PITCH = 0.6;
 const DRAG = 1.4;
 const MAX_GRADE = 0.75;
 const GRADE_RATE = 1.4;
-const OPEN_AT = 0.9; // share of the road that must be levelled to reopen it
+export const OPEN_AT = 0.85; // share of the road that must be levelled to reopen it
 const CELL_HALF = 3.3; // the part of the road that has ruts to level
 export const ROAD_WIDTH = 4.5;
+
+// Field fuel: a small tank at the cut block holds ONE tankful. An NPC tanker truck tops it up from the mill depot.
+export const FIELD_TANK_RADIUS = 5.5; // how close a machine must be to use it
+const TANKER_SPEED = 8; // u/s along the road
+const TANKER_FILL = 3; // s spent pumping at the tank
+const TANKER_RELOAD = 10; // s at the depot before it can be sent again
+const TANKER_CALL_BELOW = 0.5; // the tanker is sent when the field tank drops under this
+const TANKER_YIELD = 5.5; // it waits for any machine this far ahead on the road
+// Machines start parked in a row beside the road, each angled 45 degrees towards it.
+const START_FROM = 8; // metres along the road from the mill where the row begins (the log truck, nearest the mill)
+const START_GAP = 7.5; // straight-line gap between parked machines
+const START_COUNT = 4;
+const PARK_OFFSET = 7.5; // metres off the road centre line
 
 export type TreeKind = "forest" | "marked" | "blocker";
 export interface Tree { x: number; z: number; s: number; alive: boolean; kind: TreeKind }
@@ -43,14 +56,20 @@ export interface Log { id: number; x: number; z: number; heading: number; at: nu
 export interface Deadfall { id: number; x: number; z: number; heading: number; cleared: boolean }
 export interface RoadCell { cell: number; x: number; z: number; t: number; rut: number }
 export interface Zone { x: number; z: number; r: number }
+export interface FieldTank extends Zone { fuel: number; heading: number } // fuel: 1 = one full machine tank
+export type TankerState = "depot" | "out" | "fill" | "back";
+/** The NPC tanker: hidden at the depot, drives out along the road to the field tank, pumps, and drives back. */
+export interface Tanker { state: TankerState; s: number; timer: number; x: number; y: number; z: number; heading: number; pitch: number; speed: number; waiting: boolean; waitT: number }
+export interface StartSlot { x: number; z: number; heading: number }
 
 export interface ForestWorld {
   base: Float32Array; bump: Float32Array; rough: Float32Array; heights: Float32Array; colors: Float32Array; roadV: Uint8Array;
-  path: { x: number; z: number }[]; onRoad: Uint8Array;
+  path: { x: number; z: number }[]; cum: number[]; onRoad: Uint8Array;
   road: RoadCell[]; cellToRoad: Int32Array;
   trees: Tree[]; cellTree: Int32Array;
   logs: Log[]; nextLogId: number; deadfalls: Deadfall[];
   landing: Zone & { stack: number }; mill: Zone; camp: Camp; block: { x: number; z: number };
+  start: StartSlot[]; fieldTank: FieldTank; tanker: Tanker; tankerStopS: number;
   felled: number; stacked: number; delivered: number; wasted: number; roadOpen: boolean;
   dirtyTerrain: boolean; dirtyTrees: boolean; dirtyLogs: boolean;
 }
@@ -66,7 +85,7 @@ export interface ForestVehicle {
 
 export interface ForestGame {
   world: ForestWorld; vehicles: ForestVehicle[]; active: number; msg: string; msgT: number; actionT: number; won: boolean;
-  time: number; rollovers: number; events: ForestEvent[]; fx: Fx[]; env: Env; chopT: number;
+  time: number; rollovers: number; events: ForestEvent[]; fx: Fx[]; env: Env; chopT: number; blockWarned: boolean;
 }
 
 // Mill gate at the first point, landing and cut block at the last. The old road winds between them.
@@ -93,13 +112,46 @@ const cellOf = (x: number, z: number) => {
   return i < 0 || j < 0 || i >= N || j >= N ? -1 : j * N + i;
 };
 
+/** Cumulative arc length along the route, so positions can be asked for in metres. */
+function arcLengths(path: { x: number; z: number }[]) {
+  const cum = [0];
+  for (let i = 1; i < path.length; i++) cum.push(cum[i - 1] + Math.hypot(path[i].x - path[i - 1].x, path[i].z - path[i - 1].z));
+  return cum;
+}
+
+/** The route point `s` metres from the mill, with the direction of travel (towards the cut block). */
+export function pathPoint(w: { path: { x: number; z: number }[]; cum: number[] }, s: number) {
+  const { path, cum } = w, ss = Math.max(0, Math.min(cum[cum.length - 1], s));
+  let lo = 1, hi = cum.length - 1;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid] < ss) lo = mid + 1; else hi = mid; }
+  const a = path[lo - 1], b = path[lo], f = (ss - cum[lo - 1]) / (cum[lo] - cum[lo - 1] || 1);
+  const p = path[Math.max(0, lo - 4)], q = path[Math.min(path.length - 1, lo + 3)];
+  return { x: a.x + (b.x - a.x) * f, z: a.z + (b.z - a.z) * f, heading: Math.atan2(q.x - p.x, q.z - p.z), i: lo };
+}
+
+/** A row of parking spots on the far side of the road from the camp, spaced out, each angled 45 degrees towards the road. */
+function startSlots(w: { path: { x: number; z: number }[]; cum: number[] }, camp: Camp): StartSlot[] {
+  const ref = pathPoint(w, w.cum[nearestOnPath(w.path, camp.x, camp.z).i]);
+  const campSide = Math.sign((camp.mid.x - ref.x) * Math.cos(ref.heading) - (camp.mid.z - ref.z) * Math.sin(ref.heading)) || 1;
+  const side = -campSide; // +1 = the "right" vector (cos h, -sin h) side of the road
+  const slots: StartSlot[] = [];
+  for (let s = START_FROM; slots.length < START_COUNT && s < w.cum[w.cum.length - 1]; s += 0.5) {
+    const p = pathPoint(w, s), rx = Math.cos(p.heading), rz = -Math.sin(p.heading);
+    const x = p.x + rx * side * PARK_OFFSET, z = p.z + rz * side * PARK_OFFSET, last = slots[slots.length - 1];
+    if (!last || Math.hypot(x - last.x, z - last.z) >= START_GAP) slots.push({ x, z, heading: p.heading - side * (Math.PI / 4) });
+  }
+  return slots.reverse(); // the first machine (feller) ends up furthest along the road
+}
+
 export function createForestWorld(): ForestWorld {
   const path = spline(CONTROL);
+  const cum = arcLengths(path);
   const endP = path[path.length - 1];
   const landing = { x: endP.x, z: endP.z, r: 9, stack: 0 };
   const mill = { x: path[0].x, z: path[0].z, r: 8 };
   const camp = findCamp(path, "TIMBER RIDGE", [{ x: mill.x, z: mill.z, r: 16 }, { x: landing.x, z: landing.z, r: 14 }]);
   const campT = nearestOnPath(path, camp.x, camp.z).t;
+  const start = startSlots({ path, cum }, camp);
   const hPath = (t: number) => 8 + 5 * Math.sin(t * 5.5);
   const V = (N + 1) * (N + 1);
   const base = new Float32Array(V), bump = new Float32Array(V), rough = new Float32Array(V), heights = new Float32Array(V), colors = new Float32Array(V * 3), roadV = new Uint8Array(V);
@@ -138,6 +190,7 @@ export function createForestWorld(): ForestWorld {
       || Math.hypot(x - landing.x, z - landing.z) < landing.r + 1.5
       || Math.hypot(x - mill.x, z - mill.z) < mill.r + 1.5
       || Math.hypot(x - camp.mid.x, z - camp.mid.z) < 27
+      || start.some((q) => Math.hypot(x - q.x, z - q.z) < 6)
       || Math.abs(x) > HALF - 4 || Math.abs(z) > HALF - 4;
     if (clear) continue;
     const grove = vnoise(x * 0.06 + 11, z * 0.06 + 3);
@@ -174,13 +227,25 @@ export function createForestWorld(): ForestWorld {
     }
   }
   for (const k of marked) { trees[k].kind = "marked"; trees[k].s = 1.15; }
+  // field fuel tank: inside the landing clearing, as far from the road as it fits and clear of the log pile
+  const pile = { x: landing.x + 7.5, z: landing.z - 2 };
+  let fieldTank: FieldTank = { x: landing.x, z: landing.z, r: FIELD_TANK_RADIUS, fuel: 1, heading: 0 }, bestFar = -1;
+  for (let a = 0; a < Math.PI * 2; a += Math.PI / 12) {
+    const x = landing.x + Math.cos(a) * 6.5, z = landing.z + Math.sin(a) * 6.5;
+    if (Math.hypot(x - pile.x, z - pile.z) < 6 || Math.abs(x) > HALF - 6 || Math.abs(z) > HALF - 6) continue;
+    const near = nearestOnPath(path, x, z);
+    if (near.d > bestFar) { bestFar = near.d; fieldTank = { x, z, r: FIELD_TANK_RADIUS, fuel: 1, heading: Math.atan2(path[near.i].x - x, path[near.i].z - z) }; }
+  }
+  const tankerStopS = Math.max(0, Math.min(cum[cum.length - 1] - 4, cum[nearestOnPath(path, fieldTank.x, fieldTank.z).i]));
+  const tanker: Tanker = { state: "depot", s: 0, timer: 0, x: path[0].x, y: 0, z: path[0].z, heading: 0, pitch: 0, speed: 0, waiting: false, waitT: 0 };
   const w: ForestWorld = {
-    base, bump, rough, heights, colors, roadV, path, onRoad, road, cellToRoad, trees, cellTree,
-    logs: [], nextLogId: 0, deadfalls, landing, mill, camp, block,
+    base, bump, rough, heights, colors, roadV, path, cum, onRoad, road, cellToRoad, trees, cellTree,
+    logs: [], nextLogId: 0, deadfalls, landing, mill, camp, block, start, fieldTank, tanker, tankerStopS,
     felled: 0, stacked: 0, delivered: 0, wasted: 0, roadOpen: false,
     dirtyTerrain: true, dirtyTrees: true, dirtyLogs: true,
   };
   recomputeForestHeights(w);
+  tanker.y = forestHeightAt(w, tanker.x, tanker.z);
   return w;
 }
 
@@ -223,19 +288,18 @@ function treeNear(w: ForestWorld, x: number, z: number, reach: number): number {
   return best;
 }
 
-function makeVehicle(w: ForestWorld, kind: ForestMachine, pathIdx: number, side: number): ForestVehicle {
-  const p = w.path[pathIdx], q = w.path[pathIdx + 3];
-  const heading = Math.atan2(q.x - p.x, q.z - p.z);
-  const x = p.x + Math.cos(heading) * side, z = p.z - Math.sin(heading) * side;
+function makeVehicle(w: ForestWorld, kind: ForestMachine, slot: StartSlot): ForestVehicle {
+  const { x, z, heading } = slot;
   return { kind, x, y: forestHeightAt(w, x, z), z, heading, speed: 0, pitch: 0, roll: 0, tipped: false, work: 0, logs: 0, fuel: 1, damage: 0 };
 }
 
 export function createForestGame(diff: Difficulty = "normal"): ForestGame {
   const w = createForestWorld();
-  const vehicles = [makeVehicle(w, "feller", 64, -1.6), makeVehicle(w, "grader", 50, 1.6), makeVehicle(w, "skidder", 36, -1.6), makeVehicle(w, "logtruck", 22, 1.6)];
+  const kinds: ForestMachine[] = ["feller", "grader", "skidder", "logtruck"];
+  const vehicles = kinds.map((k, i) => makeVehicle(w, k, w.start[i]));
   return {
     world: w, vehicles, active: 0, msg: "The old logging road is overgrown: clear the blockers first", msgT: 6, actionT: 0, won: false,
-    time: 0, rollovers: 0, events: [], fx: [], env: makeEnv(diff), chopT: 0,
+    time: 0, rollovers: 0, events: [], fx: [], env: makeEnv(diff), chopT: 0, blockWarned: false,
   };
 }
 
@@ -292,6 +356,8 @@ function stepVehicle(g: ForestGame, v: ForestVehicle, throttle: number, steer: n
   };
   if (!blocked) for (const o of g.vehicles) if (o !== v && away(o, VEH_RADIUS * 2)) { blocked = true; break; }
   if (!blocked) for (const c of w.camp.colliders) if (away(c, VEH_RADIUS * 0.9 + c.r)) { blocked = true; break; }
+  if (!blocked && away(w.fieldTank, VEH_RADIUS * 0.9 + 1.3)) blocked = true;
+  if (!blocked && w.tanker.state !== "depot" && away(w.tanker, VEH_RADIUS + 1.8)) blocked = true;
   if (!blocked) for (const c of deadfallColliders(w)) if (away(c, VEH_RADIUS * 0.9 + c.r)) { blocked = true; if (me && v.kind !== "skidder") say(g, "Deadfall across the road: only the skidder can drag it aside"); break; }
   if (!blocked) { // standing trees are solid: fell them or drive around
     const k = treeNear(w, nx, nz, TREE_RADIUS);
@@ -337,7 +403,8 @@ function stepVehicle(g: ForestGame, v: ForestVehicle, throttle: number, steer: n
   }
 }
 
-type Action = { label: string; time: number; run: () => void } | null;
+/** `blocked` is a reason the job cannot be done yet: it is shown whenever Space is held. */
+type Action = { label: string; time: number; run: () => void; blocked?: string } | null;
 
 const dist2 = (a: { x: number; z: number }, b: { x: number; z: number }) => Math.hypot(a.x - b.x, a.z - b.z);
 
@@ -351,11 +418,31 @@ export function currentForestAction(g: ForestGame): Action {
   if (dist2(v, pump) < pump.r && (v.fuel < 0.97 || v.damage > 0.03)) {
     return { label: "Refuel & repair", time: REFUEL_TIME, run: () => { v.fuel = 1; v.damage = 0; emit(g, "load"); say(g, "Tank full, machine repaired"); } };
   }
+  const ft = w.fieldTank;
+  if (dist2(v, ft) < ft.r && v.fuel < 0.97) {
+    if (ft.fuel < 0.02) {
+      const eta = tankerEta(w);
+      const label = eta === null ? "Field tank empty: the tanker comes once the road is open" : `Field tank empty: tanker arrives in ${Math.ceil(eta)} s`;
+      return { label, time: Infinity, run: () => {}, blocked: label };
+    }
+    const part = ft.fuel < 1 - v.fuel - 0.02;
+    return { label: part ? `Refuel from field tank (only ${Math.round(ft.fuel * 100)}% left)` : "Refuel from field tank", time: REFUEL_TIME, run: () => {
+      const give = Math.min(ft.fuel, 1 - v.fuel);
+      ft.fuel -= give; v.fuel += give; emit(g, "load");
+      const eta = tankerEta(w);
+      if (ft.fuel >= TANKER_CALL_BELOW) say(g, "Refuelled from the field tank");
+      else say(g, eta === null ? "Field tank is low: the tanker comes once the road is open" : `Field tank is low: tanker called, back in about ${Math.ceil(eta)} s`);
+    } };
+  }
   if (v.kind === "feller") {
     const k = treeNear(w, px, pz, 2.8);
     if (k < 0) return null;
     const t = w.trees[k];
-    const label = t.kind === "blocker" ? "Fell blocking tree" : t.kind === "marked" && w.roadOpen ? "Fell marked tree" : "Fell tree (not marked: no log)";
+    if (t.kind === "marked" && !w.roadOpen) { // never let a marked tree be cut early: it would be lost for good
+      const why = "Cut block closed: restore the road first (clear blockers, grade 85%)";
+      return { label: why, time: Infinity, run: () => {}, blocked: why };
+    }
+    const label = t.kind === "blocker" ? "Fell blocking tree" : t.kind === "marked" ? "Fell marked tree" : "Fell tree (not marked: no log)";
     return { label, time: FELL_TIME, run: () => {
       t.alive = false; w.cellTree[cellOf(t.x, t.z)] = -1;
       w.dirtyTrees = true;
@@ -365,12 +452,12 @@ export function currentForestAction(g: ForestGame): Action {
       if (t.kind === "blocker") {
         const left = blockersLeft(w);
         say(g, left ? `Blocker cleared: ${left} left` : "All blockers cleared! Now level the road with the grader");
-      } else if (t.kind === "marked" && w.roadOpen) {
+      } else if (t.kind === "marked") {
         w.logs.push({ id: w.nextLogId++, x: t.x + fx * 2.2, z: t.z + fz * 2.2, heading: v.heading + (hash(k, 3) - 0.5) * 0.5, at: g.time + FALL_TIME });
         w.felled++; w.dirtyLogs = true;
       } else {
         w.wasted++;
-        say(g, w.roadOpen ? "Not a marked tree: wasted" : "Restore the road first: that tree is wasted");
+        say(g, "Not a marked tree: wasted");
       }
     } };
   }
@@ -414,13 +501,64 @@ export function currentForestAction(g: ForestGame): Action {
   return null;
 }
 
+/** Seconds until the field tank is full again, or null while the tanker cannot leave (road still closed). */
+export function tankerEta(w: ForestWorld): number | null {
+  const T = w.tanker, S = w.tankerStopS;
+  switch (T.state) {
+    case "depot": return w.roadOpen ? T.timer + S / TANKER_SPEED + TANKER_FILL : null;
+    case "out": return (S - T.s) / TANKER_SPEED + TANKER_FILL;
+    case "fill": return Math.max(0, T.timer);
+    case "back": return T.s / TANKER_SPEED + TANKER_RELOAD + S / TANKER_SPEED + TANKER_FILL;
+  }
+}
+
+/** The NPC tanker: sent from the depot whenever the field tank runs low and the road is open. */
+function stepTanker(g: ForestGame, dt: number) {
+  const w = g.world, T = w.tanker, tank = w.fieldTank;
+  T.speed = 0; T.waiting = false;
+  if (T.state === "depot") {
+    T.timer = Math.max(0, T.timer - dt);
+    if (w.roadOpen && T.timer <= 0 && tank.fuel < TANKER_CALL_BELOW) { T.state = "out"; T.s = 0; T.waitT = 0; }
+    return;
+  }
+  if (T.state === "fill") {
+    T.timer -= dt;
+    if (T.timer <= 0) { tank.fuel = 1; T.state = "back"; emit(g, "load"); say(g, "Tanker delivered: the field tank is full"); }
+    return;
+  }
+  const dir = T.state === "out" ? 1 : -1;
+  const hx = Math.sin(T.heading), hz = Math.cos(T.heading);
+  T.waiting = g.vehicles.some((o) => {
+    const dx = o.x - T.x, dz = o.z - T.z, ahead = dx * hx + dz * hz;
+    return ahead > 0 && ahead < TANKER_YIELD && Math.abs(dx * hz - dz * hx) < 2.6;
+  });
+  if (T.waiting) {
+    T.waitT += dt;
+    if (T.waitT > 2.5 && g.msgT <= 0) { say(g, "The tanker is stuck behind a machine: move off the road"); T.waitT = -6; }
+  } else {
+    T.waitT = 0; T.s += dir * TANKER_SPEED * dt; T.speed = TANKER_SPEED;
+  }
+  if (T.state === "out" && T.s >= w.tankerStopS) { T.s = w.tankerStopS; T.state = "fill"; T.timer = TANKER_FILL; T.speed = 0; }
+  else if (T.state === "back" && T.s <= 0) { T.s = 0; T.state = "depot"; T.timer = TANKER_RELOAD; T.speed = 0; return; }
+  const p = pathPoint(w, T.s);
+  T.x = p.x; T.z = p.z; T.heading = dir > 0 ? p.heading : p.heading + Math.PI;
+  const L = 2.2, f = Math.sin(T.heading), c = Math.cos(T.heading);
+  const hf = forestHeightAt(w, T.x + f * L, T.z + c * L), hb = forestHeightAt(w, T.x - f * L, T.z - c * L);
+  T.pitch = Math.atan2(hb - hf, 2 * L); T.y = (hf + hb) / 2;
+}
+
 export function stepForestGame(g: ForestGame, inp: Input, dt: number) {
   g.vehicles.forEach((v, i) => {
     const me = i === g.active;
     stepVehicle(g, v, me ? inp.throttle : 0, me ? inp.steer : 0, dt, me);
   });
+  stepTanker(g, dt);
   const w = g.world, v = g.vehicles[g.active];
   const act = inp.action ? currentForestAction(g) : null;
+  if (act?.blocked && g.msgT <= 0) say(g, act.blocked);
+  if (!w.roadOpen && !g.blockWarned && dist2(v, w.landing) < 32) { // first time anyone drives into the cut block
+    g.blockWarned = true; say(g, "Cut block is closed until the road is restored");
+  }
   if (act && Number.isFinite(act.time) && Math.abs(v.speed) < 1) {
     g.actionT += dt;
     if (v.kind === "feller" && (g.chopT += dt) > 0.28) { g.chopT = 0; emit(g, "chop"); }
@@ -430,7 +568,7 @@ export function stepForestGame(g: ForestGame, inp: Input, dt: number) {
   if (g.msgT > 0) g.msgT -= dt;
   if (!w.roadOpen && blockersLeft(w) === 0 && roadLevelled(w) >= OPEN_AT) {
     w.roadOpen = true; w.dirtyTrees = true; emit(g, "stack");
-    say(g, "Road restored! Fell the trees with orange ribbons in the cut block");
+    say(g, "Road restored! The cut block is open: fell the trees with orange ribbons");
   }
   if (!g.won) {
     g.time += dt;
@@ -486,7 +624,7 @@ export function forestHint(g: ForestGame): { text: string; machine: ForestMachin
       ? { text: `Fell the trees blocking the old road (${left} blockers left)`, machine: "feller" }
       : { text: `Drag the fallen log off the road: hold Space at it (${left} blockers left)`, machine: "skidder" };
   }
-  if (!w.roadOpen) return { text: `Level the rutted road: drive the grader along it (${Math.floor(roadLevelled(w) * 100)}%)`, machine: "grader" };
+  if (!w.roadOpen) return { text: `Level the rutted road: drive the grader along the red and amber flags (${Math.floor(roadLevelled(w) * 100)}% of ${Math.round(OPEN_AT * 100)}%)`, machine: "grader" };
   if (w.felled < LOG_TARGET) {
     const n = LOG_TARGET - w.felled;
     return { text: `Fell the ${n} marked tree${n > 1 ? "s" : ""} with orange ribbons in the cut block (end of the road)`, machine: "feller" };

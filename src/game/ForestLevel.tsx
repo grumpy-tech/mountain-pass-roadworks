@@ -3,11 +3,12 @@ import { useContext, useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import CampScene, { Label } from "./Camp";
 import {
-  FALL_TIME, FOREST_MACHINES, LOG_TARGET, SKIDDER_CAPACITY, TRUCK_CAPACITY, WASTE_ALLOWANCE, blockersLeft, blockersTotal, createForestGame, currentForestAction,
-  cycleForestVehicle, forestHeightAt, forestHint, forestProgress, recomputeForestHeights, recoverForest, roadLevelled, selectForestVehicle, stepForestGame,
+  FALL_TIME, FOREST_MACHINES, LOG_TARGET, OPEN_AT, SKIDDER_CAPACITY, TRUCK_CAPACITY, WASTE_ALLOWANCE, blockersLeft, blockersTotal, createForestGame, currentForestAction,
+  cycleForestVehicle, forestHeightAt, forestHint, forestProgress, pathPoint, recomputeForestHeights, recoverForest, roadLevelled, selectForestVehicle, stepForestGame, tankerEta,
   type ForestMachine, type ForestVehicle, type ForestWorld, type ForestGame,
 } from "./forest";
-import { Beacon, Glass, Lamp, PAINT, Stack, Tracks, Wheels, mat } from "./parts";
+import GroundMarks from "./GroundMarks";
+import { Beacon, Glass, Lamp, PAINT, Stack, Tracks, Wheels, mat, useEnv } from "./parts";
 import { FxBus, FxCtx, emitAt } from "./Particles";
 import { LevelShell, type BaseVehicle, type LevelProps, type LevelSpec } from "./Shell";
 import { CELL, N, nearestOnPath } from "./world";
@@ -50,7 +51,7 @@ function Terrain({ world }: { world: ForestWorld }) {
   );
 }
 
-const YELLOW = new THREE.Color("#ffd400"), ORANGE = new THREE.Color("#ff7a1a");
+const YELLOW = new THREE.Color("#ffd400"), ORANGE = new THREE.Color("#ff7a1a"), LOCKED = new THREE.Color("#8f4a40");
 
 function Trees({ world }: { world: ForestWorld }) {
   const trunk = useRef<THREE.InstancedMesh>(null!), low = useRef<THREE.InstancedMesh>(null!), high = useRef<THREE.InstancedMesh>(null!), tape = useRef<THREE.InstancedMesh>(null!);
@@ -67,10 +68,12 @@ function Trees({ world }: { world: ForestWorld }) {
       o.scale.setScalar(k); o.rotation.y = i;
       o.position.set(t.x, y + 2.3 * k, t.z); o.updateMatrix(); low.current.setMatrixAt(i, o.matrix);
       o.position.set(t.x, y + 4 * k, t.z); o.updateMatrix(); high.current.setMatrixAt(i, o.matrix);
-      // survey markers floating above the crown: yellow on road blockers, orange on the marked trees once the road is open
-      const show = t.alive && (t.kind === "blocker" || (t.kind === "marked" && world.roadOpen));
-      o.rotation.set(0, i, 0); o.scale.setScalar(show ? 1 : 0); o.position.set(t.x, y + 6.6 * t.s, t.z); o.updateMatrix();
-      tape.current.setMatrixAt(i, o.matrix); tape.current.setColorAt(i, t.kind === "blocker" ? YELLOW : ORANGE);
+      // survey markers floating above the crown: yellow on road blockers; marked trees are a small dull red while the road is
+      // still closed (locked: they can't be cut yet) and turn bright orange once the cut block opens
+      const show = t.alive && (t.kind === "blocker" || t.kind === "marked");
+      const small = t.kind === "marked" && !world.roadOpen;
+      o.rotation.set(0, i, 0); o.scale.setScalar(show ? (small ? 0.7 : 1) : 0); o.position.set(t.x, y + 6.6 * t.s, t.z); o.updateMatrix();
+      tape.current.setMatrixAt(i, o.matrix); tape.current.setColorAt(i, t.kind === "blocker" ? YELLOW : small ? LOCKED : ORANGE);
     });
     for (const m of [trunk, low, high, tape]) m.current.instanceMatrix.needsUpdate = true;
     if (tape.current.instanceColor) tape.current.instanceColor.needsUpdate = true;
@@ -246,13 +249,137 @@ function Landmarks({ world }: { world: ForestWorld }) {
   );
 }
 
-/** A sign at the cut block, at the far end of the road. */
+/** A sign at the cut block, at the far end of the road: red and CLOSED until the road is restored, then orange and OPEN. */
 function BlockSign({ world }: { world: ForestWorld }) {
   const x = world.landing.x - 10, z = world.landing.z + 4;
+  const closed = useRef<THREE.Group>(null!), open = useRef<THREE.Group>(null!);
+  useFrame(() => { closed.current.visible = !world.roadOpen; open.current.visible = world.roadOpen; });
   return (
     <group position={[x, forestHeightAt(world, x, z), z]} rotation={[0, 0.5, 0]}>
       {[-1.4, 1.4].map((px) => <mesh key={px} position={[px, 1.2, 0]} castShadow><boxGeometry args={[0.15, 2.4, 0.15]} />{mat("#5a4630")}</mesh>)}
-      <group position={[0, 1.9, 0.1]}><Label text="CUT BLOCK" w={3.4} h={1.1} size={64} bg="#ff7a1a" fg="#1a1a1a" /></group>
+      <group ref={closed} position={[0, 1.9, 0.1]}><Label text="CUT BLOCK CLOSED" w={3.4} h={1.1} size={42} bg="#b3382c" fg="#ffffff" /></group>
+      <group ref={open} position={[0, 1.9, 0.1]} visible={false}><Label text="CUT BLOCK OPEN" w={3.4} h={1.1} size={46} bg="#ff7a1a" fg="#1a1a1a" /></group>
+    </group>
+  );
+}
+
+const FLAG_GAP = 17, FLAG_SIDE = 4.4;
+const FLAG_RED = new THREE.Color("#e23b2e"), FLAG_AMBER = new THREE.Color("#f2b01e"), FLAG_GREEN = new THREE.Color("#3fbf5a");
+
+/** A few survey flags along the old road: red while its stretch is still rutted, amber part-way, green once graded. */
+function RoadFlags({ world }: { world: ForestWorld }) {
+  const poles = useRef<THREE.InstancedMesh>(null!), cloth = useRef<THREE.InstancedMesh>(null!);
+  const o = useMemo(() => new THREE.Object3D(), []);
+  const acc = useRef(1);
+  const flags = useMemo(() => {
+    const L = world.cum[world.cum.length - 1], n = world.path.length - 1;
+    const near = (x: number, z: number) =>
+      world.trees.some((t) => t.alive && t.kind === "blocker" && Math.hypot(t.x - x, t.z - z) < 4.5) || world.deadfalls.some((d) => Math.hypot(d.x - x, d.z - z) < 7);
+    const out: { x: number; z: number; h: number; cells: number[] }[] = [];
+    let side = 1;
+    for (let s = 20; s < L - 14; s += FLAG_GAP, side = -side) {
+      let ss = s, p = pathPoint(world, ss), x = 0, z = 0;
+      for (let tries = 0; tries < 3; tries++) {
+        p = pathPoint(world, ss);
+        x = p.x + Math.cos(p.heading) * side * FLAG_SIDE; z = p.z - Math.sin(p.heading) * side * FLAG_SIDE;
+        if (!near(x, z)) break;
+        ss += 6;
+      }
+      if (near(x, z) || Math.hypot(x - world.camp.mid.x, z - world.camp.mid.z) < 24 || Math.hypot(x - world.landing.x, z - world.landing.z) < world.landing.r + 3 || Math.hypot(x - world.mill.x, z - world.mill.z) < world.mill.r + 4) continue;
+      const cells: number[] = [];
+      world.road.forEach((r, i) => { if (Math.abs(world.cum[Math.round(r.t * n)] - ss) < FLAG_GAP / 2) cells.push(i); });
+      out.push({ x, z, h: p.heading, cells });
+    }
+    return out;
+  }, [world]);
+  useEffect(() => {
+    flags.forEach((f, i) => {
+      const y = forestHeightAt(world, f.x, f.z);
+      o.rotation.set(0, 0, 0); o.scale.setScalar(1); o.position.set(f.x, y + 1.2, f.z); o.updateMatrix(); poles.current.setMatrixAt(i, o.matrix);
+      o.rotation.set(0, f.h - Math.PI / 2, 0); o.position.set(f.x + Math.sin(f.h) * 0.5, y + 2.05, f.z + Math.cos(f.h) * 0.5); o.updateMatrix(); cloth.current.setMatrixAt(i, o.matrix);
+      cloth.current.setColorAt(i, FLAG_RED);
+    });
+    poles.current.instanceMatrix.needsUpdate = true; cloth.current.instanceMatrix.needsUpdate = true;
+    if (cloth.current.instanceColor) cloth.current.instanceColor.needsUpdate = true;
+  }, [flags, world, o]);
+  useFrame((_, dt) => {
+    acc.current += dt;
+    if (acc.current < 0.3) return;
+    acc.current = 0;
+    flags.forEach((f, i) => {
+      let rut = 0;
+      for (const c of f.cells) rut = Math.max(rut, world.road[c].rut);
+      cloth.current.setColorAt(i, rut > 0.5 ? FLAG_RED : rut > 0.06 ? FLAG_AMBER : FLAG_GREEN);
+    });
+    if (cloth.current.instanceColor) cloth.current.instanceColor.needsUpdate = true;
+  });
+  const n = Math.max(1, flags.length);
+  return (
+    <>
+      <instancedMesh ref={poles} args={[undefined, undefined, n]} count={flags.length} castShadow frustumCulled={false}>
+        <cylinderGeometry args={[0.05, 0.06, 2.4, 5]} />{mat("#d8d8d8")}
+      </instancedMesh>
+      <instancedMesh ref={cloth} args={[undefined, undefined, n]} count={flags.length} frustumCulled={false}>
+        <boxGeometry args={[0.9, 0.55, 0.05]} /><meshBasicMaterial toneMapped={false} />
+      </instancedMesh>
+    </>
+  );
+}
+
+/** The small field fuel tank at the cut block: a gauge shows how much is left (it only holds one machine's tankful). */
+function FieldTankMesh({ world }: { world: ForestWorld }) {
+  const t = world.fieldTank, y = forestHeightAt(world, t.x, t.z);
+  const gauge = useRef<THREE.Mesh>(null!), bulb = useRef<THREE.MeshStandardMaterial>(null!), bar = useRef<THREE.MeshStandardMaterial>(null!);
+  useFrame(({ clock }) => {
+    const f = t.fuel, col = f > 0.5 ? "#3fbf5a" : f > 0.02 ? "#f2b01e" : "#e23b2e";
+    gauge.current.scale.y = Math.max(0.02, f); gauge.current.position.y = 0.2 + 0.7 * Math.max(0.02, f) / 2 + 0.55;
+    bar.current.color.set(col); bar.current.emissive.set(col);
+    bulb.current.emissiveIntensity = f > 0.02 ? 0.6 : 0.4 + 1.6 * Math.max(0, Math.sin(clock.elapsedTime * 5)); // blinks red when empty
+    bulb.current.color.set(col); bulb.current.emissive.set(col);
+  });
+  return (
+    <group position={[t.x, y, t.z]} rotation={[0, t.heading, 0]}>
+      <mesh position={[0, 0.06, 0]} receiveShadow><cylinderGeometry args={[2.1, 2.2, 0.12, 12]} />{mat("#6b6358")}</mesh>
+      {[-0.6, 0.6].map((z) => <mesh key={z} position={[0, 0.28, z]} castShadow><boxGeometry args={[1.5, 0.32, 0.2]} />{mat("#3a3a3a")}</mesh>)}
+      <mesh position={[0, 1.05, 0]} rotation={[Math.PI / 2, 0, 0]} castShadow><cylinderGeometry args={[0.62, 0.62, 2, 10]} />{mat("#c8392b")}</mesh>
+      <mesh position={[0, 1.05, 0]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.64, 0.64, 0.4, 10]} />{mat("#f2f2f2")}</mesh>
+      <mesh position={[0, 1.72, 0.3]}><cylinderGeometry args={[0.14, 0.14, 0.2, 6]} />{mat("#e8b322")}</mesh>
+      <mesh position={[1.05, 1.25, -0.4]}><boxGeometry args={[0.16, 0.9, 0.2]} />{mat("#222")}</mesh>
+      <mesh ref={gauge} position={[1.14, 1.25, -0.4]}><boxGeometry args={[0.08, 0.7, 0.1]} /><meshStandardMaterial ref={bar} color="#3fbf5a" emissive="#3fbf5a" emissiveIntensity={0.6} /></mesh>
+      <mesh position={[0, 2.5, 1.4]} castShadow><cylinderGeometry args={[0.06, 0.06, 5, 5]} />{mat("#c9ced3")}</mesh>
+      <mesh position={[0, 4.85, 1.4]}><sphereGeometry args={[0.28, 8, 6]} /><meshStandardMaterial ref={bulb} color="#3fbf5a" emissive="#3fbf5a" emissiveIntensity={0.6} /></mesh>
+      <group position={[0, 3.4, 1.45]}><Label text="FIELD FUEL" w={1.9} h={0.6} size={64} bg="#c8392b" fg="#ffffff" /></group>
+    </group>
+  );
+}
+
+/** The NPC tanker truck: only visible while it is out on the road with fuel for the field tank. */
+function TankerMesh({ world }: { world: ForestWorld }) {
+  const T = world.tanker, g = useRef<THREE.Group>(null!), bus = useContext(FxCtx), acc = useRef(0);
+  const { lamps } = useEnv();
+  useFrame((_, delta) => {
+    g.current.visible = T.state !== "depot";
+    if (!g.current.visible) return;
+    g.current.position.set(T.x, T.y, T.z);
+    g.current.rotation.set(0, 0, 0); g.current.rotateY(T.heading); g.current.rotateX(T.pitch);
+    acc.current += delta;
+    if (acc.current > 0.25) { acc.current = 0; emitAt(bus, g, "smoke", [1.02, 3, 1.1]); }
+  });
+  return (
+    <group ref={g} visible={false}>
+      <Wheels v={T} zs={[-1.9, -0.6, 1.4]} />
+      <mesh position={[0, 1.4, 1.7]} castShadow><boxGeometry args={[1.9, 1.3, 1.2]} />{mat("#e8e8e8")}</mesh>
+      <Glass p={[0, 1.65, 2.31]} s={[1.65, 0.6, 0.05]} />
+      <Glass p={[0.96, 1.65, 1.75]} s={[0.04, 0.55, 0.8]} /><Glass p={[-0.96, 1.65, 1.75]} s={[0.04, 0.55, 0.8]} />
+      <Lamp p={[0.7, 1.08, 2.33]} s={[0.3, 0.22, 0.06]} on={lamps} color="#fff3c4" /><Lamp p={[-0.7, 1.08, 2.33]} s={[0.3, 0.22, 0.06]} on={lamps} color="#fff3c4" />
+      <Lamp p={[0.85, 1.0, -3.22]} s={[0.3, 0.2, 0.05]} on={lamps} color="#ff2a1a" /><Lamp p={[-0.85, 1.0, -3.22]} s={[0.3, 0.2, 0.05]} on={lamps} color="#ff2a1a" />
+      <Stack p={[1.02, 2.25, 1.1]} h={1.4} />
+      <Beacon p={[0, 2.05, 1.7]} on />
+      <mesh position={[0, 0.9, -0.7]} castShadow><boxGeometry args={[2.1, 0.3, 5]} />{mat("#333")}</mesh>
+      <mesh position={[0, 1.95, -0.8]} rotation={[Math.PI / 2, 0, 0]} castShadow><cylinderGeometry args={[0.98, 0.98, 4.2, 12]} />{mat("#c8392b")}</mesh>
+      <mesh position={[0, 1.95, -0.8]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[1, 1, 0.5, 12]} />{mat("#f2f2f2")}</mesh>
+      <mesh position={[0, 2.98, -0.8]}><cylinderGeometry args={[0.2, 0.2, 0.15, 6]} />{mat("#444")}</mesh>
+      {[-1, 1].map((sd) => <group key={sd} position={[sd * 1.0, 1.95, -0.8]} rotation={[0, sd * Math.PI / 2, 0]}><Label text="FUEL" w={1.6} h={0.5} size={80} bg="#f2f2f2" fg="#c8392b" /></group>)}
     </group>
   );
 }
@@ -409,6 +536,13 @@ const ROLES: Record<ForestMachine, string> = {
 };
 const CHUNKS = 48;
 
+function fieldFuelText(w: ForestWorld) {
+  const f = w.fieldTank.fuel, eta = tankerEta(w), pct = `${Math.round(f * 100)}%`;
+  if (f >= 0.99) return "full";
+  if (w.tanker.state === "depot" && f >= 0.5) return pct;
+  return eta === null ? `${pct} · waits for road` : `${pct} · tanker ${Math.ceil(eta)} s`;
+}
+
 export default function ForestLevel(props: LevelProps) {
   const game = useMemo(() => createForestGame(props.settings.difficulty), []); // eslint-disable-line react-hooks/exhaustive-deps
   const world = game.world;
@@ -424,7 +558,7 @@ export default function ForestLevel(props: LevelProps) {
       game,
       machines: Object.fromEntries((Object.keys(FOREST_MACHINES) as ForestMachine[]).map((k) => [k, { ...FOREST_MACHINES[k], weight: WEIGHT[k], paint: PAINT[k], lamp: LAMP[k] }])),
       roles: ROLES,
-      jobOrder: `1. Clear the blockers on the old road: fell the yellow-taped trees (feller) and drag the fallen logs aside (skidder). 2. Level the rutted road by driving the grader along it. 3. At the cut block (end of the road) fell only the ${LOG_TARGET} trees with orange ribbons. 4. Skid the logs to the landing, load the truck (it holds ${TRUCK_CAPACITY}) and haul to the sawmill at the camp end. Felling unmarked trees gives no log. Steep slopes and ruts tip a loaded truck.`,
+      jobOrder: `1. Clear the blockers on the old road: fell the yellow-taped trees (feller) and drag the fallen logs aside (skidder). 2. Level the rutted road by driving the grader along it until ${Math.round(OPEN_AT * 100)}% is done: the survey flags go from red to green as each stretch is graded. 3. Only then does the cut block open (the sign changes from CLOSED to OPEN): fell just the ${LOG_TARGET} trees with orange ribbons. Until the road is restored they are locked, shown on the map as hollow rings, and can't be cut. 4. Skid the logs to the landing, load the truck (it holds ${TRUCK_CAPACITY}) and haul to the sawmill at the camp end. Felling unmarked trees gives no log. Steep slopes and ruts tip a loaded truck.`,
       winText: "The sawmill has its logs.",
       par: 600,
       penalties: () => Math.max(0, world.wasted - WASTE_ALLOWANCE),
@@ -436,6 +570,12 @@ export default function ForestLevel(props: LevelProps) {
       cycle: (d) => cycleForestVehicle(game, d),
       hint: () => forestHint(game),
       progress: () => forestProgress(world),
+      fuelNote: "A small field tank at the cut block holds one machine's tankful, so you can refuel there without the long drive back. An NPC tanker truck refills it from the sawmill depot, but only once the road is open and only after it has driven out and back: until it arrives, the tank is empty.",
+      refuelHint: () => {
+        const ft = world.fieldTank, eta = tankerEta(world);
+        if (ft.fuel > 0.05) return "Field tank at the cut block has fuel: hold Space beside it, or drive to the camp tank";
+        return eta === null ? "Drive to the tank at the camp and hold Space (the field tank is empty)" : `Field tank is empty, tanker arrives in ${Math.ceil(eta)} s: or drive to the camp tank and hold Space`;
+      },
       cargo: () => {
         const v = game.vehicles[game.active];
         const stack = `Landing stack: ${world.landing.stack}`;
@@ -447,10 +587,11 @@ export default function ForestLevel(props: LevelProps) {
         const left = blockersLeft(world), lvl = Math.floor(roadLevelled(world) * 100);
         return [
           ["Road blockers", left ? `${left} of ${blockersTotal(world)} left` : "cleared", left === 0],
-          ["Road levelled", `${lvl}%`, world.roadOpen],
-          ["Marked trees felled", `${world.felled}/${LOG_TARGET}`, world.felled >= LOG_TARGET],
+          ["Road levelled", `${lvl}% / ${Math.round(OPEN_AT * 100)}%`, world.roadOpen],
+          ["Marked trees felled", world.roadOpen ? `${world.felled}/${LOG_TARGET}` : `locked · ${world.felled}/${LOG_TARGET}`, world.felled >= LOG_TARGET],
           ["Logs at landing", `${world.stacked}/${LOG_TARGET}`, world.stacked >= LOG_TARGET],
           ["Delivered to sawmill", `${world.delivered}/${LOG_TARGET}`, world.delivered >= LOG_TARGET],
+          ["Field fuel tank", fieldFuelText(world), false],
         ];
       },
       map: () => {
@@ -463,12 +604,18 @@ export default function ForestLevel(props: LevelProps) {
           const a = world.path[Math.round((c / CHUNKS) * (world.path.length - 1))], b = world.path[Math.round(((c + 1) / CHUNKS) * (world.path.length - 1))];
           segs.push({ x1: a.x, z1: a.z, x2: b.x, z2: b.z, color: blocked[c] ? "#d1493b" : rut[c] > 0.5 ? "#5e7a3c" : rut[c] > 0.06 ? "#a08a52" : "#d9c08a" });
         }
-        const pump = world.camp.fuel;
-        return { segs, pins: [
-          { x: world.camp.x, z: world.camp.z, color: "#f2c230", label: "C" }, { x: pump.x, z: pump.z, color: "#ff8a3d", label: "F" },
-          { x: world.mill.x, z: world.mill.z, color: "#5aa0e0", label: "M" }, { x: world.landing.x, z: world.landing.z, color: "#ffffff", label: "L" },
-          { x: world.block.x, z: world.block.z, color: "#ff7a1a", label: "B" },
-        ] };
+        const pump = world.camp.fuel, ft = world.fieldTank, T = world.tanker;
+        return {
+          segs,
+          pins: [
+            { x: world.camp.x, z: world.camp.z, color: "#f2c230", label: "C" }, { x: pump.x, z: pump.z, color: "#ff8a3d", label: "F" },
+            { x: world.mill.x, z: world.mill.z, color: "#5aa0e0", label: "M" }, { x: world.landing.x, z: world.landing.z, color: "#ffffff", label: "L" },
+            { x: world.block.x, z: world.block.z, color: "#ff7a1a", label: "B" },
+            { x: ft.x, z: ft.z, color: ft.fuel > 0.5 ? "#3fbf5a" : ft.fuel > 0.02 ? "#f2b01e" : "#e23b2e", label: "T", r: 4.5 },
+          ],
+          trees: world.trees.filter((t) => t.kind === "marked" && t.alive).map((t) => ({ x: t.x, z: t.z, locked: !world.roadOpen })),
+          movers: T.state === "depot" ? [] : [{ x: T.x, z: T.z, color: "#ff8a3d" }],
+        };
       },
       scene: <ForestScene game={game} />,
       vehicle: (v: BaseVehicle, active, lamps) => <ForestVehicleMesh v={v as unknown as ForestVehicle} active={active} night={lamps} />,
@@ -486,6 +633,10 @@ function ForestScene({ game }: { game: ForestGame }) {
       <FallingTrees bus={bus} world={world} />
       <Logs game={game} />
       <Landmarks world={world} />
+      <RoadFlags world={world} />
+      <FieldTankMesh world={world} />
+      <TankerMesh world={world} />
+      <GroundMarks machines={game.vehicles} heightAt={(x, z) => forestHeightAt(world, x, z)} />
       <CampScene camp={world.camp} hy={(x, z) => forestHeightAt(world, x, z)} />
     </>
   );

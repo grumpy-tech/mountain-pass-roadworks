@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
-  FALL_TIME, LOG_TARGET, SKIDDER_CAPACITY, TRUCK_CAPACITY, blockersLeft, blockersTotal, createForestGame, currentForestAction, cycleForestVehicle, forestHint,
-  recoverForest, roadLevelled, selectForestVehicle, stepForestGame, type ForestGame, type ForestMachine, type ForestVehicle,
+  FALL_TIME, LOG_TARGET, OPEN_AT, SKIDDER_CAPACITY, TRUCK_CAPACITY, blockersLeft, blockersTotal, createForestGame, currentForestAction, cycleForestVehicle, forestHint,
+  pathPoint, recoverForest, roadLevelled, selectForestVehicle, stepForestGame, tankerEta, type ForestGame, type ForestMachine, type ForestVehicle,
 } from "./forest";
 import { nearestOnPath } from "./world";
+
+/** Hold the tanker's clock forward until `until` is true, in 0.1 s steps. */
+const runUntil = (g: ForestGame, until: () => boolean, max = 400) => {
+  let t = 0;
+  while (!until() && t < max) { stepForestGame(g, { throttle: 0, steer: 0, action: false }, 0.1); t += 0.1; }
+  return t;
+};
 
 const hold = (g: ForestGame, seconds: number, action = true) => {
   for (let t = 0; t < seconds; t += 0.05) stepForestGame(g, { throttle: 0, steer: 0, action }, 0.05);
@@ -67,17 +74,50 @@ describe("forest level", () => {
       gr.speed = 3;
       stepForestGame(g, { throttle: 0, steer: 0, action: false }, 0.1);
     }
-    expect(roadLevelled(w)).toBeGreaterThan(0.9);
+    expect(roadLevelled(w)).toBeGreaterThan(OPEN_AT);
     expect(w.roadOpen).toBe(true);
+  });
+
+  it("reopens the road at 85% levelled, not before", () => {
+    const g = createForestGame(), w = g.world;
+    w.trees.forEach((t) => { if (t.kind === "blocker") t.alive = false; });
+    w.deadfalls.forEach((d) => { d.cleared = true; });
+    expect(OPEN_AT).toBe(0.85);
+    const levelled = (share: number) => w.road.forEach((r, i) => { r.rut = i < Math.floor(w.road.length * share) ? 0 : 1; });
+    levelled(0.8);
+    hold(g, 0.1, false);
+    expect(w.roadOpen).toBe(false);
+    levelled(0.87);
+    hold(g, 0.1, false);
+    expect(w.roadOpen).toBe(true);
+  });
+
+  it("marked trees are locked until the road is open: they can't be cut and the player is told why", () => {
+    const g = createForestGame(), w = g.world, f = drive(g, "feller");
+    const marked = w.trees.find((t) => t.kind === "marked")!;
+    place(f, marked.x, marked.z - 3);
+    const act = currentForestAction(g);
+    expect(act?.blocked).toMatch(/restore the road/i);
+    expect(Number.isFinite(act!.time)).toBe(false);
+    hold(g, 3);
+    expect(marked.alive).toBe(true); // still standing, so the job can still be finished
+    expect(w.wasted).toBe(0);
+    expect(w.felled).toBe(0);
+    expect(g.msg).toMatch(/closed/i);
+    expect(w.trees.filter((t) => t.kind === "marked" && t.alive)).toHaveLength(LOG_TARGET);
+  });
+
+  it("warns the first time a machine drives into the closed cut block", () => {
+    const g = createForestGame(), w = g.world;
+    place(drive(g, "grader"), w.landing.x - 6, w.landing.z + 6);
+    hold(g, 0.1, false);
+    expect(g.blockWarned).toBe(true);
+    expect(g.msg).toMatch(/cut block is closed/i);
   });
 
   it("only marked trees give logs, and only after the road is open", () => {
     const g = createForestGame(), w = g.world, f = drive(g, "feller");
-    const marked = w.trees.find((t) => t.kind === "marked")!, plain = w.trees.find((t) => t.kind === "forest")!;
-    place(f, marked.x, marked.z - 3);
-    hold(g, 1.5);
-    expect(w.logs).toHaveLength(0);
-    expect(w.wasted).toBe(1); // too early: the road is still closed
+    const plain = w.trees.find((t) => t.kind === "forest")!;
     openRoad(g);
     const m2 = w.trees.find((t) => t.kind === "marked" && t.alive)!;
     place(f, m2.x, m2.z - 3);
@@ -86,7 +126,7 @@ describe("forest level", () => {
     expect(w.felled).toBe(1);
     place(f, plain.x, plain.z - 3);
     hold(g, 1.5);
-    expect(w.wasted).toBe(2);
+    expect(w.wasted).toBe(1);
     expect(w.logs).toHaveLength(1);
   });
 
@@ -177,5 +217,95 @@ describe("forest level", () => {
     expect(forestHint(g).machine).toBe("logtruck");
     veh(g, "logtruck").logs = TRUCK_CAPACITY;
     expect(forestHint(g).text).toMatch(/sawmill|mill/);
+  });
+  it("starts the machines in a spread-out row beside the road, each angled 45 degrees towards it", () => {
+    const g = createForestGame(), w = g.world;
+    expect(g.vehicles.map((v) => v.kind)).toEqual(["feller", "grader", "skidder", "logtruck"]);
+    g.vehicles.forEach((v, i) => {
+      const n = nearestOnPath(w.path, v.x, v.z), p = w.path[n.i], q = w.path[Math.min(w.path.length - 1, n.i + 3)];
+      const road = Math.atan2(q.x - p.x, q.z - p.z);
+      let diff = v.heading - road; diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+      expect(Math.abs(Math.abs(diff) - Math.PI / 4)).toBeLessThan(0.08); // 45 degrees off the road direction
+      expect(n.d).toBeGreaterThan(6.3); expect(n.d).toBeLessThan(9); // beside the road, not on it
+      // nose points at the road: moving forward a bit brings it closer
+      expect(Math.hypot(p.x - (v.x + Math.sin(v.heading) * 3), p.z - (v.z + Math.cos(v.heading) * 3))).toBeLessThan(n.d);
+      for (const o of g.vehicles.slice(i + 1)) expect(Math.hypot(o.x - v.x, o.z - v.z)).toBeGreaterThan(7); // not clumped
+      expect(w.trees.some((t) => Math.hypot(t.x - v.x, t.z - v.z) < 3.5)).toBe(false);
+      for (const c of w.camp.colliders) expect(Math.hypot(c.x - v.x, c.z - v.z)).toBeGreaterThan(c.r + 3);
+      expect(Math.hypot(v.x - w.mill.x, v.z - w.mill.z)).toBeGreaterThan(w.mill.r + 2);
+    });
+    // all four sit on the same side of the road, opposite the camp
+    const side = (x: number, z: number) => { const n = nearestOnPath(w.path, x, z), p = w.path[n.i], q = w.path[Math.min(w.path.length - 1, n.i + 3)], h = Math.atan2(q.x - p.x, q.z - p.z); return Math.sign((x - p.x) * Math.cos(h) - (z - p.z) * Math.sin(h)); };
+    expect(new Set(g.vehicles.map((v) => side(v.x, v.z))).size).toBe(1);
+    expect(side(g.vehicles[0].x, g.vehicles[0].z)).not.toBe(side(w.camp.mid.x, w.camp.mid.z));
+  });
+
+  it("puts a small fuel tank at the cut block, off the road, holding one tankful", () => {
+    const g = createForestGame(), w = g.world, ft = w.fieldTank;
+    expect(ft.fuel).toBe(1);
+    expect(Math.hypot(ft.x - w.landing.x, ft.z - w.landing.z)).toBeLessThan(w.landing.r + 2);
+    expect(nearestOnPath(w.path, ft.x, ft.z).d).toBeGreaterThan(4);
+    expect(w.tanker.state).toBe("depot");
+    expect(w.tankerStopS).toBeGreaterThan(w.cum[w.cum.length - 1] - 20);
+  });
+
+  it("the field tank refuels only one machine until the NPC tanker has been there and back", () => {
+    const g = createForestGame(), w = g.world, ft = w.fieldTank, f = veh(g, "feller"), gr = veh(g, "grader");
+    openRoad(g);
+    drive(g, "feller"); place(f, ft.x + 2, ft.z + 2);
+    f.fuel = 0.05;
+    expect(currentForestAction(g)?.label).toBe("Refuel from field tank");
+    hold(g, 2.2);
+    expect(f.fuel).toBeGreaterThan(0.99);
+    expect(ft.fuel).toBeLessThan(0.07); // one tankful taken
+    // a second machine only gets the dregs, and the tanker is already on its way
+    drive(g, "grader"); place(gr, ft.x - 2, ft.z - 2);
+    gr.fuel = 0.1;
+    stepForestGame(g, { throttle: 0, steer: 0, action: false }, 0.1);
+    expect(w.tanker.state).toBe("out");
+    expect(currentForestAction(g)?.label).toMatch(/only 5% left/);
+    hold(g, 2.2);
+    expect(gr.fuel).toBeGreaterThan(0.1); expect(gr.fuel).toBeLessThan(0.2); // only the dregs
+    expect(ft.fuel).toBeLessThan(0.02);
+    expect(currentForestAction(g)?.label).toMatch(/empty: tanker arrives in \d+ s/);
+    expect(currentForestAction(g)?.blocked).toBeTruthy();
+    const eta = tankerEta(w)!;
+    expect(eta).toBeGreaterThan(15); expect(eta).toBeLessThan(60);
+    // it really does take about that long, then the tank is full again
+    const took = runUntil(g, () => ft.fuel >= 0.99);
+    expect(Math.abs(took - eta)).toBeLessThan(3);
+    expect(["fill", "back"]).toContain(w.tanker.state);
+    gr.fuel = 0.1; hold(g, 0.1, false);
+    expect(currentForestAction(g)?.label).toBe("Refuel from field tank");
+    // it drives back, reloads, and only then is free to be sent again
+    runUntil(g, () => w.tanker.state === "depot");
+    expect(w.tanker.state).toBe("depot");
+    ft.fuel = 0.2; hold(g, 0.1, false);
+    expect(w.tanker.state).toBe("depot"); // still reloading
+    runUntil(g, () => w.tanker.state === "out");
+    expect(w.tanker.state).toBe("out");
+  });
+
+  it("the tanker will not leave while the road is closed, and waits behind a machine in its way", () => {
+    const g = createForestGame(), w = g.world;
+    w.fieldTank.fuel = 0;
+    hold(g, 5, false);
+    expect(w.tanker.state).toBe("depot");
+    expect(tankerEta(w)).toBeNull();
+    openRoad(g);
+    hold(g, 0.2, false);
+    expect(w.tanker.state).toBe("out");
+    const blocker = veh(g, "logtruck");
+    hold(g, 3, false);
+    const q = pathPoint(w, w.tanker.s + 4); // park a machine right in front of it
+    place(blocker, q.x, q.z);
+    hold(g, 1, false);
+    const stuck = w.tanker.s;
+    hold(g, 2, false);
+    expect(w.tanker.s).toBeCloseTo(stuck, 5);
+    expect(w.tanker.waiting).toBe(true);
+    place(blocker, 0, 0); // machine moves away: it carries on
+    hold(g, 1, false);
+    expect(w.tanker.s).toBeGreaterThan(stuck + 4);
   });
 });

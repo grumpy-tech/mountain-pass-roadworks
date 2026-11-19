@@ -53,6 +53,10 @@ export interface LevelSpec {
   progress(): number;
   cargo(): string;
   map(): MapInfo;
+  /** Where to refuel when a machine runs low (defaults to the camp tank). */
+  refuelHint?(): string;
+  /** Extra sentence for the instructions' fuel section (e.g. a field tank). */
+  fuelNote?: string;
   /** Level meshes (terrain, props). */
   scene: ReactNode;
   /** One machine's mesh. `lamps` is true when it is dark enough for lights. */
@@ -239,7 +243,7 @@ function Help({ spec, onClose }: { spec: LevelSpec; onClose: () => void }) {
         <p className="mt-1">{spec.jobOrder}</p>
 
         <h3 className="mt-4 text-xs uppercase tracking-widest text-muted-foreground">Fuel, wear and weather</h3>
-        <p className="mt-1">Machines burn fuel while you drive them and wear down from hard hits and rollovers (slower, up to 40%). Park at the camp fuel tank and hold Space to refuel and repair. Rain and snow cut traction. A day lasts about {DAY_SECONDS / 60} minutes: headlights come on at dusk.</p>
+        <p className="mt-1">Machines burn fuel while you drive them and wear down from hard hits and rollovers (slower, up to 40%). Park at the camp fuel tank and hold Space to refuel and repair. {spec.fuelNote} Rain and snow cut traction. A day lasts about {DAY_SECONDS / 60} minutes: headlights come on at dusk.</p>
         <p className="mt-2 text-muted-foreground">The banner at the bottom always names the next job and which machine should do it. The map shows the whole route.</p>
 
         <div className="mt-5 flex justify-end">
@@ -274,7 +278,7 @@ export function LevelShell({ spec, settings, onCycleLighting, onCycleWeather, on
       action: a ? a.label : "", actionT: game.actionT, actionMax: a && Number.isFinite(a.time) ? a.time : 0,
       cargo: spec.cargo(), tasks: spec.tasks(), progress: spec.progress(), hint: spec.hint(),
       won: game.won, time: game.time, rollovers: game.rollovers, tipped: game.vehicles.map((o) => o.tipped),
-      fuel: v.fuel, damage: v.damage, lowFuel: game.vehicles.map((o) => o.fuel < LOW_FUEL),
+      fuel: v.fuel, damage: v.damage, lowFuel: game.vehicles.map((o) => o.fuel < LOW_FUEL), refuel: spec.refuelHint?.() ?? "Drive to the tank at the camp and hold Space",
       clock: clockText(S.tod), day: S.day, lamps: S.lamps, wkind: S.weather.kind, wlevel: S.weather.level,
     };
   }, [game, spec]);
@@ -457,7 +461,7 @@ export function LevelShell({ spec, settings, onCycleLighting, onCycleWeather, on
           {!hud.won && (
             <div className="pointer-events-none absolute bottom-4 left-1/2 max-w-xl -translate-x-1/2 rounded-md border-2 border-foreground/80 bg-card/90 px-4 py-2 text-center font-mono text-sm text-card-foreground shadow-lg">
               {hud.fuel < LOW_FUEL ? (
-                <><span className="mr-2 text-xs uppercase tracking-widest text-destructive">Low fuel</span>Drive to the tank at the camp and hold Space{hud.fuel <= 0 ? " (or press R for a tow)" : ""}</>
+                <><span className="mr-2 text-xs uppercase tracking-widest text-destructive">Low fuel</span>{hud.refuel}{hud.fuel <= 0 ? " (or press R for a tow)" : ""}</>
               ) : (
                 <>
                   <span className="mr-2 text-xs uppercase tracking-widest text-muted-foreground">Next</span>
