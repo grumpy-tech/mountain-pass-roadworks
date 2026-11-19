@@ -1,15 +1,19 @@
 // Pure game rules: road job state, vehicle sim, per-level setup via LevelConfig. No React / three.
 // Terrain data + lookups live in grid.ts, level generators in levels/*.ts.
 import { CELL, HALF, N, cellIndex, heightAt, nearestOnPath, roadCellAt, rockOnRoad, type Rock, type RoadCell, type World } from "./grid";
+import type { CraneInput } from "./crane";
+import { PALLETS, buildingStarted, digCell, haulSpoil, hookedPallet, inSpoilZone, nextDigCell, pickTarget, solidAt, stepSite, toggleHook, type Site } from "./site";
 
 export * from "./grid";
 
-export type Machine = "dozer" | "excavator" | "truck" | "paver";
+export type Machine = "dozer" | "excavator" | "truck" | "paver" | "crane";
 export const MACHINES: Record<Machine, { accel: number; max: number; turn: number; label: string; tracks: boolean }> = {
   dozer: { accel: 2.2, max: 5.5, turn: 1.1, label: "Bulldozer", tracks: true },
   excavator: { accel: 1.6, max: 3.5, turn: 1.0, label: "Excavator", tracks: true },
   truck: { accel: 3.2, max: 9, turn: 1.2, label: "Dump Truck", tracks: false },
   paver: { accel: 1.6, max: 4, turn: 0.9, label: "Paver", tracks: true },
+  // the tower crane never drives; "hopping in" hands the controls to site.crane
+  crane: { accel: 0, max: 0, turn: 0, label: "Tower Crane", tracks: false },
 };
 export const TRUCK_CAPACITY = 6;
 const DIG_TIME = 1.1;
@@ -30,7 +34,14 @@ export interface Vehicle {
   tipped: boolean; work: number; // action progress 0..1 for animation
 }
 
-export interface Game { world: World; vehicles: Vehicle[]; active: number; msg: string; msgT: number; actionT: number; won: boolean; level: LevelConfig }
+export interface Game {
+  world: World; vehicles: Vehicle[]; active: number; msg: string; msgT: number; actionT: number; won: boolean; level: LevelConfig;
+  /** Construction-site state (crane, deliveries, building); null on levels without a site. */
+  site: Site | null;
+  /** Machine to return to when leaving the crane. */
+  prevActive: number;
+  cam: "overview" | "cab";
+}
 
 /** Everything that differs between levels: which machines exist, how the world is generated, and the opening hint. */
 export interface LevelConfig {
@@ -40,7 +51,7 @@ export interface LevelConfig {
   /** Short job name shown in the HUD. */
   job: string;
   machines: Machine[];
-  build(): { world: World; vehicles: Vehicle[]; site: null; intro: string };
+  build(): { world: World; vehicles: Vehicle[]; site: Site | null; intro: string };
 }
 
 export function makeVehicle(w: World, kind: Machine, pathIdx: number, side: number): Vehicle {
@@ -50,12 +61,17 @@ export function makeVehicle(w: World, kind: Machine, pathIdx: number, side: numb
   return { kind, x, z, heading, speed: 0, pitch: 0, roll: 0, y: heightAt(w, x, z), dirt: 0, rock: 0, tipped: false, work: 0 };
 }
 
-export function createGame(level: LevelConfig): Game {
-  const { world, vehicles, intro } = level.build();
-  return { world, vehicles, active: 0, msg: intro, msgT: 5, actionT: 0, won: false, level };
+export function spawnVehicle(w: World, kind: Machine, x: number, z: number, heading: number): Vehicle {
+  return { kind, x, z, heading, speed: 0, pitch: 0, roll: 0, y: heightAt(w, x, z), dirt: 0, rock: 0, tipped: false, work: 0 };
 }
 
-export interface Input { throttle: number; steer: number; action: boolean }
+export function createGame(level: LevelConfig): Game {
+  const { world, vehicles, site, intro } = level.build();
+  return { world, vehicles, active: 0, msg: intro, msgT: 5, actionT: 0, won: false, level, site, prevActive: 0, cam: "overview" };
+}
+
+/** Driving: throttle/steer. Crane: throttle = trolley out/in, steer = slew, lift = hoist up/down. */
+export interface Input { throttle: number; steer: number; action: boolean; lift?: number }
 
 function say(g: Game, m: string) { g.msg = m; g.msgT = 2.5; }
 
@@ -102,6 +118,7 @@ function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: n
     const d0 = Math.hypot(o.x - v.x, o.z - v.z), d1 = Math.hypot(o.x - nx, o.z - nz);
     if (d1 < VEH_RADIUS * 2 && d1 < d0) { blocked = true; break; }
   }
+  if (!blocked && g.site && solidAt(g.site, nx, nz)) blocked = true;
   // rocks: the dozer blade pushes small rocks, everything else is an obstacle
   if (!blocked) for (const r of w.rocks) {
     const dx = r.x - nx, dz = r.z - nz;
@@ -168,6 +185,7 @@ export function currentAction(g: Game): Action {
   if (v.tipped) return null;
   const fx = Math.sin(v.heading), fz = Math.cos(v.heading);
   const px = v.x + fx * 3.2, pz = v.z + fz * 3.2; // reach point
+  if (g.site) return siteAction(g, g.site, v, px, pz);
   if (v.kind === "excavator") {
     const held = v.dirt + v.rock;
     if (held === 0) {
@@ -218,16 +236,66 @@ export function currentAction(g: Game): Action {
   return null;
 }
 
+/** Actions on construction-site levels: dig the foundation, haul spoil, and work the crane hook. */
+function siteAction(g: Game, s: Site, v: Vehicle, px: number, pz: number): Action {
+  const w = g.world;
+  if (v.kind === "crane") {
+    // the hook is tapped (not held): Space calls craneAction
+    if (hookedPallet(s)) return { label: "Space: release load", time: Infinity, run: () => {} };
+    const near = pickTarget(s);
+    return near ? { label: `Space: hook ${PALLETS[near.kind].label.toLowerCase()}`, time: Infinity, run: () => {} } : null;
+  }
+  if (v.kind === "excavator") {
+    if (v.dirt + v.rock === 0) {
+      const cell = nextDigCell(s, px, pz);
+      if (cell < 0) return s.dug.size < s.pitCells.length ? { label: "Move closer to the next part of the pit", time: Infinity, run: () => {} } : null;
+      return { label: "Dig foundation", time: DIG_TIME, run: () => { digCell(w, s, cell); v.dirt = 1; } };
+    }
+    const truck = g.vehicles.find((o) => o.kind === "truck" && Math.hypot(o.x - px, o.z - pz) < 4 && !o.tipped);
+    if (!truck) return { label: "Swing the bucket over the dump truck", time: Infinity, run: () => {} };
+    if (truck.dirt + truck.rock >= TRUCK_CAPACITY) return { label: "Truck is full", time: Infinity, run: () => {} };
+    return { label: "Load into truck", time: LOAD_TIME, run: () => { truck.dirt += v.dirt; truck.rock += v.rock; v.dirt = 0; v.rock = 0; } };
+  }
+  if (v.kind === "truck") {
+    const load = v.dirt + v.rock;
+    if (load === 0) return null;
+    if (!inSpoilZone(s, v.x, v.z)) return { label: "Haul the spoil to the pad outside the west gate", time: Infinity, run: () => {} };
+    return { label: `Dump load (${load})`, time: DUMP_TIME, run: () => { haulSpoil(s, load); v.dirt = 0; v.rock = 0; } };
+  }
+  return null;
+}
+
+/** Tap action for the crane (the hook). Returns true if the active machine is the crane. */
+export function craneAction(g: Game): boolean {
+  if (!g.site || g.vehicles[g.active].kind !== "crane") return false;
+  say(g, toggleHook(g.site));
+  return true;
+}
+
+export function toggleCamera(g: Game) {
+  if (g.vehicles[g.active].kind !== "crane") return;
+  g.cam = g.cam === "cab" ? "overview" : "cab";
+  say(g, g.cam === "cab" ? "Cab view" : "Overview");
+}
+
 function fillMud(w: World, rc: RoadCell, spend: () => void) {
   rc.kind = "ok"; w.mud[rc.cell] = 0; spend(); w.dirtyHazards = true;
 }
 
 export function stepGame(g: Game, inp: Input, dt: number) {
   g.vehicles.forEach((v, i) => {
+    if (v.kind === "crane") return; // fixed base; the jib is simulated in site.crane
     const me = i === g.active;
     stepVehicle(g, v, me ? inp.throttle : 0, me ? inp.steer : 0, dt);
   });
   const v = g.vehicles[g.active];
+  if (g.site) {
+    const cr: CraneInput = v.kind === "crane" ? { slew: inp.steer, trolley: inp.throttle, hoist: inp.lift ?? 0 } : { slew: 0, trolley: 0, hoist: 0 };
+    stepSite(g.site, g.world, cr, dt);
+    for (const m of g.site.notes.splice(0)) say(g, m);
+    if (buildingStarted(g.site)) evictFromFootprint(g, g.site);
+    if (!g.won && g.site.toppedOut) g.won = true;
+  }
   const act = inp.action ? currentAction(g) : null;
   if (act && Number.isFinite(act.time) && Math.abs(v.speed) < 1) {
     g.actionT += dt;
@@ -235,20 +303,42 @@ export function stepGame(g: Game, inp: Input, dt: number) {
   } else g.actionT = 0;
   for (const o of g.vehicles) o.work += ((o === v && g.actionT > 0 ? 1 : 0) - o.work) * (1 - Math.exp(-5 * dt));
   if (g.msgT > 0) g.msgT -= dt;
-  if (!g.won && progress(g.world).paved >= 0.95) { g.won = true; }
+  if (!g.site && !g.won && progress(g.world).paved >= 0.95) { g.won = true; }
+}
+
+/** Once the frame goes up the footprint is solid; move any machine still standing in the pit out to the south edge. */
+function evictFromFootprint(g: Game, s: Site) {
+  const f = s.cfg.footprint;
+  for (const o of g.vehicles) {
+    if (o.kind === "crane" || !(o.x > f.x0 - 1.4 && o.x < f.x1 + 1.4 && o.z > f.z0 - 1.4 && o.z < f.z1 + 1.4)) continue;
+    o.z = f.z1 + 3; o.speed = 0; o.y = heightAt(g.world, o.x, o.z);
+  }
 }
 
 export function switchVehicle(g: Game) {
   const v = g.vehicles[g.active];
+  if (v.kind === "crane") {
+    g.active = g.prevActive; g.cam = "overview"; g.actionT = 0;
+    say(g, `Now driving: ${MACHINES[g.vehicles[g.active].kind].label}`);
+    return;
+  }
   let best = -1, bd = 7;
   g.vehicles.forEach((o, i) => { if (i !== g.active) { const d = Math.hypot(o.x - v.x, o.z - v.z); if (d < bd) { bd = d; best = i; } } });
   if (best < 0) { say(g, "Drive closer to another machine to hop in"); return; }
-  v.speed = 0; g.active = best; g.actionT = 0;
-  say(g, `Now driving: ${MACHINES[g.vehicles[best].kind].label}`);
+  v.speed = 0; g.prevActive = g.active; g.active = best; g.actionT = 0;
+  if (g.vehicles[best].kind === "crane") say(g, "Crane: A/D slew · W/S trolley · ↑/↓ hoist · Space hook · C camera · E climb down");
+  else say(g, `Now driving: ${MACHINES[g.vehicles[best].kind].label}`);
 }
 
 export function recover(g: Game) {
   const v = g.vehicles[g.active], w = g.world;
+  if (v.kind === "crane") return;
+  if (g.site) {
+    const r = g.site.cfg.respawn;
+    v.x = r.x + g.active * 5; v.z = r.z; v.heading = r.heading; v.y = heightAt(w, v.x, v.z);
+    v.tipped = false; v.roll = 0; v.pitch = 0; v.speed = 0;
+    return;
+  }
   const n = nearestOnPath(w.path, v.x, v.z);
   const p = w.path[n.i], q = w.path[Math.min(w.path.length - 1, n.i + 3)];
   if (v.tipped || n.d > 6) { v.x = p.x; v.z = p.z; v.heading = Math.atan2(q.x - p.x, q.z - p.z); }
