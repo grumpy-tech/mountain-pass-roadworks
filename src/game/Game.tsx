@@ -2,6 +2,7 @@
 // (rules in world.ts / forest.ts, scene in RoadLevel.tsx / ForestLevel.tsx) and runs inside the shared Shell.
 import { useCallback, useState } from "react";
 import ForestLevel from "./ForestLevel";
+import { GameBoundary, NoWebGL, webglAvailable } from "./GameGuard";
 import LevelSelect, { type LevelId } from "./LevelSelect";
 import RoadLevel from "./RoadLevel";
 import type { Lighting, Settings } from "./Shell";
@@ -30,9 +31,19 @@ export default function Game() {
   const exit = useCallback(() => setLevel(null), []);
   const restart = useCallback(() => setRun((r) => r + 1), []);
 
+  const back = exit;
   if (!level) {
-    return <LevelSelect settings={settings} onPlay={setLevel} onCycleLighting={cycleLighting} onCycleWeather={cycleWeather} onToggleMute={toggleMute} onDifficulty={setDifficulty} />;
+    return (
+      <GameBoundary onBack={back}>
+        <LevelSelect settings={settings} onPlay={setLevel} onCycleLighting={cycleLighting} onCycleWeather={cycleWeather} onToggleMute={toggleMute} onDifficulty={setDifficulty} />
+      </GameBoundary>
+    );
   }
+  if (!webglAvailable()) return <NoWebGL onBack={back} />;
   const props = { settings, onCycleLighting: cycleLighting, onCycleWeather: cycleWeather, onToggleMute: toggleMute, onExit: exit, onRestart: restart };
-  return level === "timber-ridge" ? <ForestLevel key={run} {...props} /> : <RoadLevel key={run} {...props} />;
+  return (
+    <GameBoundary onBack={back}>
+      {level === "timber-ridge" ? <ForestLevel key={run} {...props} /> : <RoadLevel key={run} {...props} />}
+    </GameBoundary>
+  );
 }
