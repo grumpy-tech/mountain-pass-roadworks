@@ -1,13 +1,14 @@
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Environment, Lightformer } from "@react-three/drei";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import * as THREE from "three";
 import {
-  CELL, HALF, MACHINES, N, TRUCK_CAPACITY, createGame, currentAction, heightAt, progress, recomputeHeights, recover, stepGame, switchVehicle,
-  type Game as GameState, type Vehicle, type World,
+  CELL, HALF, MACHINES, N, TRUCK_CAPACITY, createGame, currentAction, cycleVehicle, heightAt, progress, recomputeHeights, recover, stepGame,
+  type Game as GameState, type Machine, type Vehicle, type World,
 } from "./world";
 
 const keys = new Set<string>();
+const PAINT: Record<Machine, string> = { dozer: "#e8b322", excavator: "#d9902a", truck: "#c8392b", paver: "#e06b24" };
 const DIRT = new THREE.Color("#8a6a45"), ASPHALT = new THREE.Color("#3a3c40");
 
 function Terrain({ world }: { world: World }) {
@@ -168,6 +169,52 @@ function Wheels() {
   );
 }
 
+const glass = <meshStandardMaterial color="#05070a" metalness={0.75} roughness={0.1} />;
+
+/** Blacked-out window pane. */
+function Glass({ p, s }: { p: [number, number, number]; s: [number, number, number] }) {
+  return <mesh position={p}><boxGeometry args={s} />{glass}</mesh>;
+}
+
+/** Light that glows only while its machine is the one being driven. */
+function Lamp({ p, s, on, color }: { p: [number, number, number]; s: [number, number, number]; on: boolean; color: string }) {
+  return (
+    <mesh position={p}>
+      <boxGeometry args={s} />
+      <meshStandardMaterial color={on ? color : "#3a3a3a"} emissive={color} emissiveIntensity={on ? 2.2 : 0} />
+    </mesh>
+  );
+}
+
+/** Amber roof beacon: spins and flashes while the machine is active. */
+function Beacon({ p, on }: { p: [number, number, number]; on: boolean }) {
+  const spin = useRef<THREE.Group>(null!);
+  const bulb = useRef<THREE.MeshStandardMaterial>(null!);
+  useFrame(({ clock }) => {
+    spin.current.rotation.y = clock.elapsedTime * 7;
+    bulb.current.emissiveIntensity = on ? 0.5 + 2.5 * Math.max(0, Math.sin(clock.elapsedTime * 9)) : 0;
+  });
+  return (
+    <group position={p}>
+      <mesh position={[0, 0.05, 0]}><cylinderGeometry args={[0.16, 0.2, 0.1, 8]} />{mat("#222")}</mesh>
+      <group ref={spin}>
+        <mesh position={[0, 0.22, 0]}>
+          <cylinderGeometry args={[0.13, 0.15, 0.24, 8]} />
+          <meshStandardMaterial ref={bulb} color="#ffa000" emissive="#ff9100" emissiveIntensity={0} flatShading />
+        </mesh>
+      </group>
+    </group>
+  );
+}
+
+function Stack({ p, h = 0.9 }: { p: [number, number, number]; h?: number }) {
+  return (
+    <mesh position={p} castShadow>
+      <cylinderGeometry args={[0.07, 0.09, h, 6]} /><meshStandardMaterial color="#b8bcc2" metalness={0.8} roughness={0.25} flatShading />
+    </mesh>
+  );
+}
+
 function VehicleMesh({ v, active }: { v: Vehicle; active: boolean }) {
   const g = useRef<THREE.Group>(null!);
   const arm = useRef<THREE.Group>(null!);
@@ -183,25 +230,44 @@ function VehicleMesh({ v, active }: { v: Vehicle; active: boolean }) {
       load.current.visible = f > 0;
       load.current.scale.set(1, Math.max(0.01, f), 1);
     }
-    if (marker.current) { marker.current.visible = active; marker.current.position.y = 4.2 + Math.sin(clock.elapsedTime * 3) * 0.2; }
+    if (marker.current) { marker.current.visible = active; marker.current.position.y = 4.6 + Math.sin(clock.elapsedTime * 3) * 0.2; }
   });
-  const yellow = "#e8b322";
+  const paint = PAINT[v.kind];
   return (
     <group ref={g}>
       <mesh ref={marker} rotation={[Math.PI, 0, 0]}><coneGeometry args={[0.4, 0.8, 4]} />{mat("#ffffff")}</mesh>
       {v.kind === "dozer" && (
         <>
           <Tracks />
-          <mesh position={[0, 1.05, -0.2]} castShadow><boxGeometry args={[1.6, 0.8, 2.4]} />{mat(yellow)}</mesh>
-          <mesh position={[0, 1.85, -0.6]} castShadow><boxGeometry args={[1.2, 0.9, 1.1]} />{mat(yellow)}</mesh>
-          <mesh position={[0, 0.55, 2.1]} rotation={[0.2, 0, 0]} castShadow><boxGeometry args={[3.2, 1, 0.25]} />{mat("#c99a1a")}</mesh>
+          <mesh position={[0, 1.05, -0.2]} castShadow><boxGeometry args={[1.6, 0.8, 2.4]} />{mat(paint)}</mesh>
+          <mesh position={[0, 1.46, -0.2]}><boxGeometry args={[0.4, 0.02, 2]} />{mat("#1a1a1a")}</mesh>
+          <mesh position={[0, 1.85, -0.6]} castShadow><boxGeometry args={[1.2, 0.9, 1.1]} />{mat(paint)}</mesh>
+          <mesh position={[0, 2.35, -0.6]} castShadow><boxGeometry args={[1.45, 0.08, 1.35]} />{mat("#2b2b2b")}</mesh>
+          <Glass p={[0, 1.9, -0.04]} s={[1, 0.55, 0.04]} />
+          <Glass p={[0, 1.9, -1.16]} s={[1, 0.55, 0.04]} />
+          <Glass p={[0.61, 1.9, -0.6]} s={[0.04, 0.55, 0.8]} />
+          <Glass p={[-0.61, 1.9, -0.6]} s={[0.04, 0.55, 0.8]} />
+          <Lamp p={[0.55, 1.15, 1.01]} s={[0.28, 0.2, 0.06]} on={active} color="#fff3c4" />
+          <Lamp p={[-0.55, 1.15, 1.01]} s={[0.28, 0.2, 0.06]} on={active} color="#fff3c4" />
+          <Stack p={[0.5, 1.9, 0.6]} />
+          <Beacon p={[0, 2.39, -0.6]} on={active} />
+          <mesh position={[0, 0.55, 2.1]} rotation={[0.2, 0, 0]} castShadow><boxGeometry args={[3.2, 1, 0.25]} />{mat("#9a7414")}</mesh>
         </>
       )}
       {v.kind === "excavator" && (
         <>
           <Tracks />
-          <mesh position={[0, 1.1, -0.3]} castShadow><boxGeometry args={[1.9, 0.7, 2.6]} />{mat("#d9902a")}</mesh>
-          <mesh position={[-0.45, 1.9, 0.2]} castShadow><boxGeometry args={[0.9, 0.9, 1.1]} />{mat("#d9902a")}</mesh>
+          <mesh position={[0, 1.1, -0.3]} castShadow><boxGeometry args={[1.9, 0.7, 2.6]} />{mat(paint)}</mesh>
+          <mesh position={[0, 1.1, -1.75]} castShadow><boxGeometry args={[1.8, 0.75, 0.5]} />{mat("#3a3a3a")}</mesh>
+          <mesh position={[-0.45, 1.9, 0.2]} castShadow><boxGeometry args={[0.9, 0.9, 1.1]} />{mat(paint)}</mesh>
+          <mesh position={[-0.45, 2.38, 0.2]} castShadow><boxGeometry args={[1.05, 0.07, 1.25]} />{mat("#2b2b2b")}</mesh>
+          <Glass p={[-0.45, 1.95, 0.76]} s={[0.72, 0.6, 0.04]} />
+          <Glass p={[-0.91, 1.95, 0.2]} s={[0.04, 0.6, 0.85]} />
+          <Glass p={[0.01, 1.95, 0.2]} s={[0.04, 0.6, 0.85]} />
+          <Lamp p={[-0.75, 2.46, 0.7]} s={[0.22, 0.14, 0.1]} on={active} color="#fff3c4" />
+          <Lamp p={[-0.15, 2.46, 0.7]} s={[0.22, 0.14, 0.1]} on={active} color="#fff3c4" />
+          <Stack p={[0.7, 1.95, -1.3]} h={1} />
+          <Beacon p={[-0.45, 2.42, -0.15]} on={active} />
           <group ref={arm} position={[0.4, 1.5, 0.6]}>
             <mesh position={[0, 0.6, 1.2]} rotation={[-0.5, 0, 0]} castShadow><boxGeometry args={[0.35, 0.4, 2.8]} />{mat("#c07a1e")}</mesh>
             <mesh position={[0, 0.1, 2.7]} rotation={[0.6, 0, 0]} castShadow><boxGeometry args={[0.3, 0.3, 1.6]} />{mat("#c07a1e")}</mesh>
@@ -213,8 +279,19 @@ function VehicleMesh({ v, active }: { v: Vehicle; active: boolean }) {
       {v.kind === "truck" && (
         <>
           <Wheels />
-          <mesh position={[0, 1.4, 1.7]} castShadow><boxGeometry args={[1.9, 1.3, 1.2]} />{mat("#c8392b")}</mesh>
-          <mesh position={[0, 1.6, 2.32]}><boxGeometry args={[1.6, 0.5, 0.05]} /><meshStandardMaterial color="#9fc7d8" metalness={0.3} roughness={0.2} /></mesh>
+          <mesh position={[0, 1.4, 1.7]} castShadow><boxGeometry args={[1.9, 1.3, 1.2]} />{mat(paint)}</mesh>
+          <Glass p={[0, 1.65, 2.31]} s={[1.65, 0.6, 0.05]} />
+          <Glass p={[0.96, 1.65, 1.75]} s={[0.04, 0.55, 0.8]} />
+          <Glass p={[-0.96, 1.65, 1.75]} s={[0.04, 0.55, 0.8]} />
+          <mesh position={[0, 1.08, 2.31]}><boxGeometry args={[1.2, 0.3, 0.05]} />{mat("#1a1a1a")}</mesh>
+          <mesh position={[0, 0.8, 2.38]} castShadow><boxGeometry args={[2.1, 0.25, 0.15]} />{mat("#2b2b2b")}</mesh>
+          <Lamp p={[0.7, 1.08, 2.33]} s={[0.3, 0.22, 0.06]} on={active} color="#fff3c4" />
+          <Lamp p={[-0.7, 1.08, 2.33]} s={[0.3, 0.22, 0.06]} on={active} color="#fff3c4" />
+          <Lamp p={[0.85, 1.0, -2.22]} s={[0.3, 0.2, 0.05]} on={active} color="#ff2a1a" />
+          <Lamp p={[-0.85, 1.0, -2.22]} s={[0.3, 0.2, 0.05]} on={active} color="#ff2a1a" />
+          <Stack p={[1.02, 2.25, 1.1]} h={1.4} />
+          <Stack p={[-1.02, 2.25, 1.1]} h={1.4} />
+          <Beacon p={[0, 2.05, 1.7]} on={active} />
           <mesh position={[0, 0.9, -0.2]} castShadow><boxGeometry args={[2.1, 0.3, 4]} />{mat("#333")}</mesh>
           <mesh position={[0, 1.55, -0.5]} castShadow><boxGeometry args={[2.2, 1, 3]} />{mat("#a8a8a8")}</mesh>
           <mesh ref={load} position={[0, 2.05, -0.5]}><boxGeometry args={[2, 0.8, 2.8]} />{mat("#6b4a2b")}</mesh>
@@ -223,9 +300,20 @@ function VehicleMesh({ v, active }: { v: Vehicle; active: boolean }) {
       {v.kind === "paver" && (
         <>
           <Tracks />
-          <mesh position={[0, 1.05, -0.2]} castShadow><boxGeometry args={[1.6, 0.8, 2.4]} />{mat("#e06b24")}</mesh>
-          <mesh position={[0, 1.85, -0.6]} castShadow><boxGeometry args={[1.2, 0.9, 1.1]} />{mat("#e06b24")}</mesh>
+          <mesh position={[0, 1.05, -0.2]} castShadow><boxGeometry args={[1.6, 0.8, 2.4]} />{mat(paint)}</mesh>
+          <mesh position={[0, 1.46, -0.2]}><boxGeometry args={[0.4, 0.02, 2]} />{mat("#1a1a1a")}</mesh>
+          <mesh position={[0, 1.85, -0.6]} castShadow><boxGeometry args={[1.2, 0.9, 1.1]} />{mat(paint)}</mesh>
+          <mesh position={[0, 2.35, -0.6]} castShadow><boxGeometry args={[1.45, 0.08, 1.35]} />{mat("#2b2b2b")}</mesh>
+          <Glass p={[0, 1.9, -0.04]} s={[1, 0.55, 0.04]} />
+          <Glass p={[0, 1.9, -1.16]} s={[1, 0.55, 0.04]} />
+          <Glass p={[0.61, 1.9, -0.6]} s={[0.04, 0.55, 0.8]} />
+          <Glass p={[-0.61, 1.9, -0.6]} s={[0.04, 0.55, 0.8]} />
+          <Lamp p={[0.7, 1.15, 0.99]} s={[0.28, 0.2, 0.06]} on={active} color="#fff3c4" />
+          <Lamp p={[-0.7, 1.15, 0.99]} s={[0.28, 0.2, 0.06]} on={active} color="#fff3c4" />
+          <Stack p={[-0.55, 1.9, 0.5]} h={0.8} />
+          <Beacon p={[0, 2.39, -0.6]} on={active} />
           <mesh position={[0, 0.9, 1.5]} castShadow><boxGeometry args={[2, 0.9, 0.9]} />{mat("#555")}</mesh>
+          <mesh position={[0, 1.38, 1.5]}><boxGeometry args={[2, 0.06, 0.9]} />{mat("#e8b322")}</mesh>
           <mesh position={[0, 0.3, -1.9]} rotation={[0, 0, Math.PI / 2]} castShadow><cylinderGeometry args={[0.35, 0.35, 3, 8]} />{mat("#444")}</mesh>
         </>
       )}
@@ -233,7 +321,7 @@ function VehicleMesh({ v, active }: { v: Vehicle; active: boolean }) {
   );
 }
 
-function Director({ game, onReady }: { game: GameState; onReady: () => void }) {
+function Director({ game, paused, onReady }: { game: GameState; paused: MutableRefObject<boolean>; onReady: () => void }) {
   const light = useRef<THREE.DirectionalLight>(null!);
   const { camera } = useThree();
   const frames = useRef(0);
@@ -241,7 +329,7 @@ function Director({ game, onReady }: { game: GameState; onReady: () => void }) {
     const dt = Math.min(delta, 0.05);
     const throttle = (keys.has("w") || keys.has("arrowup") ? 1 : 0) - (keys.has("s") || keys.has("arrowdown") ? 1 : 0);
     const steer = (keys.has("a") || keys.has("arrowleft") ? 1 : 0) - (keys.has("d") || keys.has("arrowright") ? 1 : 0);
-    stepGame(game, { throttle, steer, action: keys.has(" ") }, dt);
+    if (!paused.current) stepGame(game, { throttle, steer, action: keys.has(" ") }, dt);
     const v = game.vehicles[game.active];
     camera.position.lerp(new THREE.Vector3(v.x + 6, v.y + 42, v.z + 16), 1 - Math.exp(-3 * dt));
     camera.lookAt(v.x, v.y, v.z);
@@ -256,19 +344,83 @@ function Director({ game, onReady }: { game: GameState; onReady: () => void }) {
   );
 }
 
+function Key({ children }: { children: React.ReactNode }) {
+  return <kbd className="rounded border border-foreground/40 bg-muted px-1.5 py-0.5 font-mono text-xs font-bold text-foreground">{children}</kbd>;
+}
+
+const CONTROLS: [string, string][] = [
+  ["W / S  or  ↑ / ↓", "Drive forward / reverse"],
+  ["A / D  or  ← / →", "Steer"],
+  ["Space (hold)", "Work: dig, break, load, dump, fill"],
+  ["Tab / Shift+Tab", "Switch to next / previous machine"],
+  ["R", "Recover after a rollover"],
+  ["? or H", "Show / hide these instructions"],
+];
+
+function Help({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="absolute inset-0 z-50 flex items-center justify-center bg-foreground/50 p-4" role="dialog" aria-modal="true" aria-label="Instructions">
+      <div className="max-h-full w-full max-w-2xl overflow-y-auto rounded-md border-2 border-foreground bg-card p-6 font-mono text-sm text-card-foreground shadow-xl">
+        <h2 className="text-xl font-bold">Pass Road · Crew Briefing</h2>
+        <p className="mt-1 text-muted-foreground">Build the road up the mountain. Get 95% of it paved to open the pass.</p>
+
+        <h3 className="mt-4 text-xs uppercase tracking-widest text-muted-foreground">Controls</h3>
+        <ul className="mt-1 space-y-1">
+          {CONTROLS.map(([k, d]) => (
+            <li key={k} className="flex items-baseline justify-between gap-4"><Key>{k}</Key><span className="text-right">{d}</span></li>
+          ))}
+        </ul>
+
+        <h3 className="mt-4 text-xs uppercase tracking-widest text-muted-foreground">The crew</h3>
+        <ul className="mt-1 space-y-1">
+          {(Object.keys(MACHINES) as Machine[]).map((m) => (
+            <li key={m} className="flex gap-2">
+              <span className="mt-1 h-3 w-3 shrink-0 rounded-sm border border-foreground/60" style={{ background: PAINT[m] }} />
+              <span><b>{MACHINES[m].nick}</b> the {MACHINES[m].label}: {ROLES[m]}</span>
+            </li>
+          ))}
+        </ul>
+
+        <h3 className="mt-4 text-xs uppercase tracking-widest text-muted-foreground">Job order</h3>
+        <p className="mt-1">1. Clear rocks and dirt mounds, fill mud holes. 2. Drive the bulldozer over the road to grade it. 3. Drive the paver over graded dirt. Watch steep edges: loaded trucks tip easily and bog down in mud.</p>
+
+        <div className="mt-5 flex justify-end">
+          <button type="button" autoFocus onClick={onClose} className="rounded-md border-2 border-foreground bg-primary px-4 py-2 font-bold text-primary-foreground hover:opacity-90">
+            Start work <span className="ml-1 text-xs font-normal">(Enter)</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const ROLES: Record<Machine, string> = {
+  dozer: "pushes small rocks off the road and grades dirt flat.",
+  excavator: "breaks boulders, digs mounds, loads the truck.",
+  truck: "fills mud holes or dumps loads off-road.",
+  paver: "lays asphalt on graded dirt.",
+};
+
 export default function Game() {
   const game = useMemo(() => createGame(), []);
   const world = game.world;
   const [hud, setHud] = useState(() => ({ ...progress(world), active: 0, speed: 0, msg: "", action: "", actionT: 0, actionMax: 1, cargo: "", won: false }));
   const [ready, setReady] = useState(false);
+  const [help, setHelp] = useState(true); // instructions open on load; the sim is paused while they are up
+  const helpRef = useRef(true);
+  const setHelpOpen = useCallback((open: boolean) => { helpRef.current = open; keys.clear(); setHelp(open); }, []);
 
   useEffect(() => {
     if (typeof window !== "undefined") (window as unknown as { __game: GameState }).__game = game;
     const down = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
+      if (k === "tab") e.preventDefault(); // never move browser focus
+      if (e.repeat && (k === "tab" || k === "r" || k === "?" || k === "h")) return;
+      if (k === "?" || k === "h") { setHelpOpen(!helpRef.current); return; }
+      if (helpRef.current) { if (k === "escape" || k === "enter") setHelpOpen(false); return; }
       if (k === " " || k.startsWith("arrow")) e.preventDefault();
-      if (k === "e" && !e.repeat) switchVehicle(game);
-      if (k === "r" && !e.repeat) recover(game);
+      if (k === "tab") cycleVehicle(game, e.shiftKey ? -1 : 1);
+      if (k === "r") recover(game);
       keys.add(k);
     };
     const up = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
@@ -281,7 +433,7 @@ export default function Game() {
       setHud({ ...progress(world), active: game.active, speed: Math.abs(v.speed), msg: game.msgT > 0 ? game.msg : "", action: a ? a.label : "", actionT: game.actionT, actionMax: a && Number.isFinite(a.time) ? a.time : 0, cargo, won: game.won });
     }, 120);
     return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); window.removeEventListener("blur", blur); clearInterval(id); };
-  }, [game, world]);
+  }, [game, world, setHelpOpen]);
 
   const v = game.vehicles[hud.active];
   const tasks: [string, string, boolean][] = [
@@ -307,13 +459,13 @@ export default function Game() {
         <Rocks world={world} />
         <Scenery world={world} />
         {game.vehicles.map((veh, i) => <VehicleMesh key={i} v={veh} active={i === hud.active} />)}
-        <Director game={game} onReady={() => setReady(true)} />
+        <Director game={game} paused={helpRef} onReady={() => setReady(true)} />
       </Canvas>
 
       <div className="pointer-events-none absolute left-4 top-4 w-80 rounded-md border-2 border-foreground/80 bg-card/90 p-4 font-mono text-sm text-card-foreground shadow-lg">
         <div className="text-xs uppercase tracking-widest text-muted-foreground">Job · Pass Road</div>
         <div className="mt-1 flex items-baseline justify-between">
-          <span className="text-lg font-bold">{MACHINES[v.kind].label}</span>
+          <span className="text-lg font-bold">{MACHINES[v.kind].nick} <span className="text-xs font-normal text-muted-foreground">the {MACHINES[v.kind].label}</span></span>
           <span className="text-xs text-muted-foreground">{(hud.speed * 3.6).toFixed(0)} km/h</span>
         </div>
         {hud.cargo && <div className="text-xs">{hud.cargo}</div>}
@@ -341,12 +493,25 @@ export default function Game() {
         </div>
       )}
 
-      <div className="pointer-events-none absolute bottom-4 left-4 max-w-xl rounded-md bg-card/85 px-4 py-3 font-mono text-xs text-card-foreground">
-        <b>W/S</b> drive · <b>A/D</b> steer · <b>Space</b> work (hold) · <b>E</b> hop into nearby machine · <b>R</b> recover
-        <div className="mt-1 text-muted-foreground">
-          Bulldozer pushes small rocks off the road and flattens dirt · Excavator breaks boulders, digs mounds, loads the truck · Dump truck fills mud holes or dumps off-road · Paver paves flat dirt. Watch steep edges — loaded trucks tip easily and bog down in mud.
+      <div className="absolute right-4 top-4 flex flex-col items-end gap-2 font-mono text-xs">
+        <button
+          type="button" tabIndex={-1} aria-label="Show instructions" title="Instructions (?)"
+          onClick={(e) => { e.currentTarget.blur(); setHelpOpen(true); }}
+          className="h-9 w-9 rounded-full border-2 border-foreground/80 bg-card/90 text-base font-bold text-card-foreground shadow-lg hover:bg-card"
+        >?</button>
+        <div className="pointer-events-none w-44 rounded-md border-2 border-foreground/80 bg-card/90 p-2 text-card-foreground shadow-lg">
+          <div className="mb-1 uppercase tracking-widest text-muted-foreground"><Key>Tab</Key> switch</div>
+          {game.vehicles.map((veh, i) => (
+            <div key={i} className={`flex items-center gap-2 rounded px-1.5 py-1 ${i === hud.active ? "bg-primary/25 font-bold" : ""}`}>
+              <span className="h-3 w-3 shrink-0 rounded-sm border border-foreground/60" style={{ background: PAINT[veh.kind] }} />
+              <span className="flex-1 truncate">{MACHINES[veh.kind].nick}</span>
+              {veh.tipped && <span className="text-destructive">tipped</span>}
+            </div>
+          ))}
         </div>
       </div>
+
+      {help && <Help onClose={() => setHelpOpen(false)} />}
 
       {hud.won && (
         <div className="absolute inset-0 flex items-center justify-center bg-foreground/40">

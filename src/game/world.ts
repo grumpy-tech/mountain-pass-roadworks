@@ -5,11 +5,11 @@ export const HALF = (N * CELL) / 2;
 export const ROAD_HALF_WIDTH = 3.2;
 
 export type Machine = "dozer" | "excavator" | "truck" | "paver";
-export const MACHINES: Record<Machine, { accel: number; max: number; turn: number; label: string; tracks: boolean }> = {
-  dozer: { accel: 2.2, max: 5.5, turn: 1.1, label: "Bulldozer", tracks: true },
-  excavator: { accel: 1.6, max: 3.5, turn: 1.0, label: "Excavator", tracks: true },
-  truck: { accel: 3.2, max: 9, turn: 1.2, label: "Dump Truck", tracks: false },
-  paver: { accel: 1.6, max: 4, turn: 0.9, label: "Paver", tracks: true },
+export const MACHINES: Record<Machine, { accel: number; max: number; turn: number; label: string; nick: string; tracks: boolean }> = {
+  dozer: { accel: 2.2, max: 5.5, turn: 1.1, label: "Bulldozer", nick: "Bruiser", tracks: true },
+  excavator: { accel: 1.6, max: 3.5, turn: 1.0, label: "Excavator", nick: "Scoop", tracks: true },
+  truck: { accel: 3.2, max: 9, turn: 1.2, label: "Dump Truck", nick: "Rumble", tracks: false },
+  paver: { accel: 1.6, max: 4, turn: 0.9, label: "Paver", nick: "Smooth", tracks: true },
 };
 export const TRUCK_CAPACITY = 6;
 const DIG_TIME = 1.1;
@@ -381,13 +381,14 @@ export function stepGame(g: Game, inp: Input, dt: number) {
   if (!g.won && progress(g.world).paved >= 0.95) { g.won = true; }
 }
 
-export function switchVehicle(g: Game) {
-  const v = g.vehicles[g.active];
-  let best = -1, bd = 7;
-  g.vehicles.forEach((o, i) => { if (i !== g.active) { const d = Math.hypot(o.x - v.x, o.z - v.z); if (d < bd) { bd = d; best = i; } } });
-  if (best < 0) { say(g, "Drive closer to another machine to hop in"); return; }
-  v.speed = 0; g.active = best; g.actionT = 0;
-  say(g, `Now driving: ${MACHINES[g.vehicles[best].kind].label}`);
+/** Tab: jump to the next (dir = 1) or previous (dir = -1) machine, wherever it is. */
+export function cycleVehicle(g: Game, dir: 1 | -1 = 1) {
+  const n = g.vehicles.length;
+  g.vehicles[g.active].speed = 0;
+  g.active = (g.active + dir + n) % n;
+  g.actionT = 0;
+  const m = MACHINES[g.vehicles[g.active].kind];
+  say(g, `Now driving: ${m.nick} the ${m.label}`);
 }
 
 export function recover(g: Game) {
