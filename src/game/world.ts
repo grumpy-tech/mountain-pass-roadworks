@@ -1,6 +1,7 @@
 // Pure game rules: terrain generation, road job state, vehicle sim. No React / three.
 import { findCamp, type Camp } from "./campLayout";
 import { DIFF, addDamage, burnFuel, makeEnv, wearFactor, type Difficulty, type Env, type Fx, type FxKind, LOW_FUEL } from "./shared";
+import { arcLengths, nearSlot, padWeight, startSlots, type StartSlot } from "./startLayout";
 export const N = 80; // cells per side
 export const CELL = 2;
 export const HALF = (N * CELL) / 2;
@@ -49,26 +50,99 @@ export const smooth = (a: number, b: number, x: number) => {
 };
 
 
+/** "mud" marks a road cell that is part of a washout (an unfilled dip across the road). */
 export type CellKind = "ok" | "mound" | "mud";
 export interface RoadCell { cell: number; x: number; z: number; t: number; kind: CellKind; mound: number; stage: 1 | 2 | 3; level: number; pave: number }
 export interface Rock { id: number; x: number; z: number; r: number; big: boolean; spin: number }
 
+/** One terrain vertex shaped by a washout: how deep it dips (negative = raised lip), how wet it looks, its dry colour. */
+interface WashVert { v: number; d: number; wet: number; c0: [number, number, number] }
+/**
+ * A washout: water has cut a dip across the road. `cells` are the road cells it covers (one dirt each to fill);
+ * `shown` is the filled fraction drawn so far (it eases towards filled/cells so the dip rises smoothly).
+ */
+export interface Washout { id: number; x: number; z: number; angle: number; len: number; cells: number[]; filled: number; shown: number; verts: WashVert[] }
+
 export interface World {
   path: { x: number; z: number }[];
-  base: Float32Array; bump: Float32Array; rough: Float32Array; heights: Float32Array;
+  base: Float32Array; bump: Float32Array; rough: Float32Array; dip: Float32Array; heights: Float32Array;
   colors: Float32Array;
   road: RoadCell[]; cellToRoad: Int32Array;
   mud: Uint8Array; mudCells: number[];
+  washouts: Washout[];
   trees: { x: number; z: number; s: number }[];
   boulders: { x: number; z: number; s: number }[];
   rocks: Rock[]; rockCapacity: number; nextRockId: number;
-  camp: Camp;
+  camp: Camp; start: StartSlot[];
   dirtyTerrain: boolean; dirtyCells: Set<number>; dirtyHazards: boolean;
 }
 
 export const pathX = (t: number) => 34 * Math.sin(t * Math.PI * 2.2) + 10 * Math.sin(t * 9 + 1);
 export const pathH = (t: number) => t * 22;
 const PZ0 = HALF - 26, PZL = 2 * HALF - 52;
+
+// Washouts: a few places where water has cut a dip across the road (not a field of holes).
+const WASH_COUNT = 4;
+const WASH_FROM = 0.2, WASH_TO = 0.95; // route fractions the washouts are spread over, one per equal stretch
+const WASH_DEPTH = 0.75; // metres the dip sinks below the road (a loaded truck still crosses it without tipping: see world.test.ts)
+const WASH_HALF = 1.7; // half-width of the dip along the road
+const WASH_LEN = 4.4; // half-length of the dip across the road
+const WASH_CLEAR = 5; // no mounds or loose rocks this close to a washout
+const WASH_REACH = 2.8; // a bucket or tailgate within this of an unfilled washout cell can fill it
+const WET: [number, number, number] = [0.3, 0.21, 0.14];
+
+interface WashSpec { x: number; z: number; angle: number }
+
+/** One washout per stretch of the route, each on the straightest bit of it and well away from the camp. */
+function planWashouts(path: { x: number; z: number }[], camp: Camp, start: StartSlot[]): WashSpec[] {
+  const out: WashSpec[] = [], n = path.length - 1;
+  const head = (a: number, b: number) => Math.atan2(path[b].x - path[a].x, path[b].z - path[a].z);
+  const span = (WASH_TO - WASH_FROM) / WASH_COUNT;
+  for (let k = 0; k < WASH_COUNT; k++) {
+    const lo = WASH_FROM + k * span;
+    let best = -1, bs = 1e9;
+    for (let i = Math.round((lo + span * 0.25) * n); i <= Math.round((lo + span * 0.75) * n); i += 2) {
+      const p = path[i];
+      if (Math.hypot(p.x - camp.mid.x, p.z - camp.mid.z) < 32 || start.some((q) => Math.hypot(p.x - q.x, p.z - q.z) < 16)) continue;
+      const dh = head(i, i + 12) - head(i - 12, i), turn = Math.abs(Math.atan2(Math.sin(dh), Math.cos(dh)));
+      const score = turn + hash(i * 0.37, k + 1) * 0.05;
+      if (score < bs) { bs = score; best = i; }
+    }
+    if (best < 0) continue;
+    const p = path[best];
+    out.push({ x: p.x, z: p.z, angle: head(best - 3, best + 3) + Math.PI / 2 + (hash(best, 9.1) - 0.5) * 0.45 });
+  }
+  return out;
+}
+
+/** Position of (x, z) relative to a washout's centre line: across the dip (`perp`) and along its length. */
+function washFrame(s: WashSpec, x: number, z: number) {
+  const dx = x - s.x, dz = z - s.z;
+  return { along: dx * Math.sin(s.angle) + dz * Math.cos(s.angle), perp: dx * Math.cos(s.angle) - dz * Math.sin(s.angle) };
+}
+
+/** How much of a dip (`bowl`) and of the raised bank beside it (`lip`) sits at (x, z). */
+function washProfile(s: WashSpec, x: number, z: number) {
+  const { along, perp } = washFrame(s, x, z), ap = Math.abs(perp), end = 1 - smooth(WASH_LEN - 0.6, WASH_LEN + 1.4, Math.abs(along));
+  return {
+    bowl: (1 - smooth(0, WASH_HALF + 1.3, ap)) * end,
+    lip: smooth(WASH_HALF + 0.4, WASH_HALF + 2, ap) * (1 - smooth(WASH_HALF + 2, WASH_HALF + 3.6, ap)) * end,
+  };
+}
+
+const washoutAt = (specs: WashSpec[], x: number, z: number) =>
+  specs.findIndex((s) => { const f = washFrame(s, x, z); return Math.abs(f.perp) < 1.05 && Math.abs(f.along) < ROAD_HALF_WIDTH + 0.4; });
+
+/** Write a washout's current depth and wetness into the terrain; it eases away as the washout is filled. */
+function applyWashout(w: World, wo: Washout) {
+  const k = 1 - wo.shown;
+  for (const q of wo.verts) {
+    w.dip[q.v] = q.d * k;
+    const m = q.wet * k;
+    for (let c = 0; c < 3; c++) w.colors[q.v * 3 + c] = q.c0[c] + (WET[c] - q.c0[c]) * m;
+  }
+  w.dirtyTerrain = true;
+}
 
 export function createWorld(): World {
   const path: { x: number; z: number }[] = [];
@@ -77,9 +151,13 @@ export function createWorld(): World {
   const camp = findCamp(path, "PASS ROAD WORKS");
   const nearCamp = (x: number, z: number, r: number) => Math.hypot(x - camp.mid.x, z - camp.mid.z) < r;
   const campT = nearestOnPath(path, camp.x, camp.z).t;
+  const start = startSlots({ path, cum: arcLengths(path) }, camp);
+  const startH = start.map((q) => pathH(nearestOnPath(path, q.x, q.z).t)); // road height beside each parking pad
+  const specs = planWashouts(path, camp, start);
+  const washouts: Washout[] = specs.map((s, id) => ({ id, x: s.x, z: s.z, angle: s.angle, len: WASH_LEN, cells: [], filled: 0, shown: 0, verts: [] }));
   const V = (N + 1) * (N + 1);
   const base = new Float32Array(V), bump = new Float32Array(V), rough = new Float32Array(V), colors = new Float32Array(V * 3);
-  const dist = new Float32Array(V);
+  const dist = new Float32Array(V), pad = new Float32Array(V);
   for (let r = 0; r <= N; r++) for (let c = 0; c <= N; c++) {
     const v = r * (N + 1) + c, x = -HALF + c * CELL, z = -HALF + r * CELL;
     const { d, t } = nearest(x, z);
@@ -89,7 +167,15 @@ export function createWorld(): World {
     const plateau = 1 - smooth(21, 34, Math.hypot(x - camp.mid.x, z - camp.mid.z)); // level ground under the camp
     base[v] = (pathH(t) + s * m) * (1 - plateau) + pathH(campT) * plateau;
     bump[v] = (vnoise(x * 0.4, z * 0.4) - 0.5) * 2.2 * (1 - smooth(4, 7, d));
+    const pw = padWeight(start, x, z); // a level shelf under every parked machine
+    if (pw.w > 0) { base[v] = base[v] * (1 - pw.w) + startH[pw.i] * pw.w; bump[v] *= 1 - pw.w; pad[v] = pw.w; }
     rough[v] = 1;
+    specs.forEach((sp, k) => { // carve each washout: a smooth gully with a low bank either side
+      const { bowl, lip } = washProfile(sp, x, z), sh = Math.max(bowl, lip);
+      if (sh < 0.02) return;
+      bump[v] *= 1 - 0.85 * sh;
+      washouts[k].verts.push({ v, d: WASH_DEPTH * bowl - 0.14 * lip, wet: bowl, c0: [0, 0, 0] });
+    });
   }
   for (let r = 0; r <= N; r++) for (let c = 0; c <= N; c++) {
     const v = r * (N + 1) + c, h = base[v], d = dist[v];
@@ -100,10 +186,11 @@ export function createWorld(): World {
     else if (rel > 14) col = [0.5, 0.48, 0.46];
     else if (rel > 7) col = [0.42, 0.5, 0.33];
     else col = [0.4, 0.58, 0.3];
-    if (nearCamp(-HALF + c * CELL, -HALF + r * CELL, 26) && d > 4.6) col = [0.55, 0.5, 0.42]; // gravel yard
+    if ((nearCamp(-HALF + c * CELL, -HALF + r * CELL, 26) && d > 4.6) || pad[v] > 0.5) col = [0.55, 0.5, 0.42]; // gravel yard / parking pads
     const j = 0.9 + hash(c, r) * 0.2;
     colors.set([col[0] * j, col[1] * j, col[2] * j], v * 3);
   }
+  for (const wo of washouts) for (const q of wo.verts) q.c0 = [colors[q.v * 3], colors[q.v * 3 + 1], colors[q.v * 3 + 2]];
   const road: RoadCell[] = [];
   const cellToRoad = new Int32Array(N * N).fill(-1);
   const mud = new Uint8Array(N * N);
@@ -117,18 +204,19 @@ export function createWorld(): World {
     const mudNoise = vnoise(x * 0.12 + 9, z * 0.12);
     if (d < ROAD_HALF_WIDTH) {
       const early = t < 0.06 || nearCamp(x, z, 26); // keep the camp and parking area clear
+      const wi = washoutAt(specs, x, z), nearWash = specs.some((s) => Math.hypot(x - s.x, z - s.z) < WASH_CLEAR);
       let kind: CellKind = "ok";
-      if (!early && vnoise(x * 0.15, z * 0.15 + 4) > 0.8) kind = "mound";
-      else if (!early && mudNoise > 0.86) kind = "mud";
+      if (wi >= 0) kind = "mud";
+      else if (!early && !nearWash && vnoise(x * 0.15, z * 0.15 + 4) > 0.8) kind = "mound";
       cellToRoad[j * N + i] = road.length;
       road.push({ cell: j * N + i, x, z, t, kind, mound: kind === "mound" ? 2 : 0, stage: 1, level: 0, pave: 0 });
-      if (kind === "mud") mud[j * N + i] = 1;
-      if (!early && kind === "ok") {
+      if (kind === "mud") { mud[j * N + i] = 1; washouts[wi].cells.push(road.length - 1); }
+      if (!early && !nearWash && kind === "ok") {
         if (h > 0.965) { rocks.push({ id: id++, x, z, r: 1.4, big: true, spin: h * 9 }); bigCount++; }
         else if (h > 0.8) rocks.push({ id: id++, x: x + (h - 0.9) * 2, z, r: 0.55 + h * 0.2, big: false, spin: h * 20 });
       }
-    } else if (nearCamp(x, z, 28)) {
-      // camp yard: no scenery
+    } else if (nearCamp(x, z, 28) || nearSlot(start, x, z)) {
+      // camp yard and the parking row: no scenery
     } else {
       if (d < 6 && mudNoise > 0.7) mud[j * N + i] = 1; // off-road bog
       else if (d > 7 && d < 22 && h > 0.9) trees.push({ x, z, s: 0.8 + hash(i, j) * 0.8 });
@@ -138,10 +226,11 @@ export function createWorld(): World {
   const mudCells: number[] = [];
   mud.forEach((m, k) => { if (m) mudCells.push(k); });
   const w: World = {
-    path, base, bump, rough, heights: new Float32Array(V), colors, road, cellToRoad, mud, mudCells, trees, boulders,
-    rocks, rockCapacity: rocks.length + bigCount * 3, nextRockId: id, camp,
+    path, base, bump, rough, dip: new Float32Array(V), heights: new Float32Array(V), colors, road, cellToRoad, mud, mudCells, washouts, trees, boulders,
+    rocks, rockCapacity: rocks.length + bigCount * 3, nextRockId: id, camp, start,
     dirtyTerrain: true, dirtyCells: new Set(), dirtyHazards: true,
   };
+  washouts.forEach((wo) => applyWashout(w, wo));
   recomputeHeights(w);
   return w;
 }
@@ -156,7 +245,7 @@ export function nearestOnPath(path: { x: number; z: number }[], x: number, z: nu
 }
 
 export function recomputeHeights(w: World) {
-  for (let v = 0; v < w.heights.length; v++) w.heights[v] = w.base[v] + w.bump[v] * w.rough[v];
+  for (let v = 0; v < w.heights.length; v++) w.heights[v] = w.base[v] + w.bump[v] * w.rough[v] - w.dip[v];
 }
 
 export function heightAt(w: World, x: number, z: number) {
@@ -200,19 +289,16 @@ export interface Game {
   time: number; rollovers: number; events: GameEvent[]; fx: Fx[]; env: Env;
 }
 
-function makeVehicle(w: World, kind: Machine, pathIdx: number, side: number): Vehicle {
-  const p = w.path[pathIdx], q = w.path[pathIdx + 3];
-  const heading = Math.atan2(q.x - p.x, q.z - p.z);
-  const x = p.x + Math.cos(heading) * side, z = p.z - Math.sin(heading) * side;
+function makeVehicle(w: World, kind: Machine, slot: StartSlot): Vehicle {
+  const { x, z, heading } = slot;
   return { kind, x, z, heading, speed: 0, pitch: 0, roll: 0, y: heightAt(w, x, z), dirt: 0, rock: 0, tipped: false, work: 0, fuel: 1, damage: 0 };
 }
 
 export function createGame(diff: Difficulty = "normal"): Game {
   const w = createWorld();
-  const vehicles = [makeVehicle(w, "dozer", 14, 0), makeVehicle(w, "excavator", 6, -1.5), makeVehicle(w, "truck", 2, 1.8), makeVehicle(w, "paver", 22, 0)];
-  // nudge paver behind start so it isn't in the way
-  const pv = makeVehicle(w, "paver", 1, -2.2);
-  vehicles[3] = pv;
+  // Parked in a spread-out row beside the road (startLayout.ts). Slot 0 is furthest along the road: the machine that works first.
+  const kinds: Machine[] = ["dozer", "excavator", "truck", "paver"];
+  const vehicles = kinds.map((k, i) => makeVehicle(w, k, w.start[i]));
   return { world: w, vehicles, active: 0, msg: "Push the rocks off the road with the bulldozer", msgT: 5, actionT: 0, won: false, time: 0, rollovers: 0, events: [], fx: [], env: makeEnv(diff) };
 }
 
@@ -377,12 +463,20 @@ export function currentAction(g: Game): Action {
           w.dirtyHazards = true;
         } };
       }
-      const hole = roadCellAt(w, px, pz);
-      if (hole && hole.kind === "mud") return { label: "Hole needs dirt: dig a mound first", time: Infinity, run: () => {} };
+      const hole = washoutCellNear(w, px, pz);
+      const mounds = w.road.some((r) => r.kind === "mound");
+      if (hole && mounds) return { label: "Washout needs dirt: dig a mound first", time: Infinity, run: () => {} };
+      // Dirt must never run out (every mound can be dug and dumped): with no mounds left, scoop it beside the road.
+      if (!mounds && !hole && !roadCellAt(w, px, pz) && cellIndex(px, pz) >= 0 && !w.camp.colliders.some((c) => Math.hypot(c.x - px, c.z - pz) < c.r + 1)) {
+        return { label: "Scoop roadside dirt", time: DIG_TIME, run: () => { emit(g, "dig"); puff(g, "dirt", px, pz, 12); v.dirt = 1; } };
+      }
+      if (hole) return { label: "Washout needs dirt: scoop it beside the road", time: Infinity, run: () => {} };
       return null;
     }
     const rc = roadCellAt(w, px, pz);
-    if (rc && rc.kind === "mud" && v.dirt) return { label: "Fill mud hole", time: FILL_TIME, run: () => fillMud(g, rc, () => { v.dirt = 0; }) };
+    const hole = washoutCellNear(w, px, pz);
+    if (hole && v.dirt) return { label: `Fill washout (${washoutLeft(w, hole)} left here)`, time: FILL_TIME, run: () => fillWashout(g, hole, () => { v.dirt = 0; }) };
+    if (hole) return { label: "Bucket holds a rock: dump it off the road first", time: Infinity, run: () => {} };
     const truck = g.vehicles.find((o) => o.kind === "truck" && Math.hypot(o.x - px, o.z - pz) < 4 && !o.tipped);
     if (truck) {
       if (truck.dirt + truck.rock >= TRUCK_CAPACITY) return { label: "Truck is full", time: Infinity, run: () => {} };
@@ -395,20 +489,36 @@ export function currentAction(g: Game): Action {
     const load = v.dirt + v.rock;
     if (load === 0) return null;
     const bx = v.x - fx * 2.5, bz = v.z - fz * 2.5; // tips out the back
-    const rc = roadCellAt(w, bx, bz);
-    if (rc && rc.kind === "mud" && v.dirt > 0) return { label: "Tip dirt into mud", time: FILL_TIME, run: () => fillMud(g, rc, () => { v.dirt -= 1; }) };
+    const rc = roadCellAt(w, bx, bz), hole = washoutCellNear(w, bx, bz);
+    if (hole && v.dirt > 0) return { label: `Tip dirt into washout (${washoutLeft(w, hole)} left here)`, time: FILL_TIME, run: () => fillWashout(g, hole, () => { v.dirt -= 1; }) };
     if (!rc && !roadCellAt(w, v.x, v.z)) return { label: `Dump load (${load})`, time: DUMP_TIME, run: () => { emit(g, "dump"); puff(g, "dirt", bx, bz, 20); v.dirt = 0; v.rock = 0; } };
-    return { label: v.dirt > 0 ? "Back up to mud, or drive off-road to dump" : "Drive off-road to dump rocks", time: Infinity, run: () => {} };
+    return { label: v.dirt > 0 ? "Back the tailgate up to a washout, or drive off-road to dump" : "Drive off-road to dump rocks", time: Infinity, run: () => {} };
   }
   return null;
 }
 
-function fillMud(g: Game, rc: RoadCell, spend: () => void) {
-  const w = g.world;
-  emit(g, "fill"); rc.kind = "ok"; w.mud[rc.cell] = 0; spend(); w.dirtyHazards = true;
+/** The nearest unfilled washout cell whose centre is within `r` of (x, z). A washout is a few cells wide: any of them will do. */
+function washoutCellNear(w: World, x: number, z: number, r = WASH_REACH): RoadCell | null {
+  let best: RoadCell | null = null, bd = r;
+  for (const wo of w.washouts) for (const k of wo.cells) {
+    const rc = w.road[k];
+    if (rc.kind !== "mud") continue;
+    const d = Math.hypot(rc.x - x, rc.z - z);
+    if (d < bd) { bd = d; best = rc; }
+  }
+  return best;
+}
+
+const washoutOf = (w: World, rc: RoadCell) => w.washouts.find((wo) => wo.cells.some((k) => w.road[k] === rc))!;
+const washoutLeft = (w: World, rc: RoadCell) => { const wo = washoutOf(w, rc); return wo.cells.length - wo.filled; };
+
+/** One dirt fills one cell of a washout; the dip rises as its cells fill. */
+function fillWashout(g: Game, rc: RoadCell, spend: () => void) {
+  const w = g.world, wo = washoutOf(w, rc);
+  emit(g, "fill"); rc.kind = "ok"; w.mud[rc.cell] = 0; spend(); wo.filled++; w.dirtyHazards = true;
   puff(g, "splash", rc.x, rc.z, 16); puff(g, "dirt", rc.x, rc.z, 12);
-  const left = w.road.filter((r) => r.kind === "mud").length;
-  say(g, left ? `Mud hole filled: ${left} left` : "Last mud hole filled!");
+  const left = w.washouts.filter((o) => o.filled < o.cells.length).length;
+  say(g, wo.filled < wo.cells.length ? `Washout ${wo.filled}/${wo.cells.length} filled` : left ? `Washout filled: ${left} left` : "Last washout filled!");
 }
 
 export function stepGame(g: Game, inp: Input, dt: number) {
@@ -424,6 +534,10 @@ export function stepGame(g: Game, inp: Input, dt: number) {
   } else g.actionT = 0;
   for (const o of g.vehicles) o.work += ((o === v && g.actionT > 0 ? 1 : 0) - o.work) * (1 - Math.exp(-5 * dt));
   if (g.msgT > 0) g.msgT -= dt;
+  for (const wo of g.world.washouts) { // the dip rises smoothly as cells are filled
+    const target = wo.filled / wo.cells.length;
+    if (wo.shown < target) { wo.shown = Math.min(target, wo.shown + dt * 0.9); applyWashout(g.world, wo); }
+  }
   if (!g.won) { g.time += dt; if (progress(g.world).paved >= 0.95) { g.won = true; emit(g, "win"); } }
 }
 
@@ -470,7 +584,8 @@ export function progress(w: World) {
   let rocksOnRoad = 0;
   for (const r of w.rocks) if (rockOnRoad(w, r)) rocksOnRoad++;
   const n = w.road.length;
-  return { graded: graded / n, paved: paved / n, mounds, mud, rocksOnRoad };
+  const washouts = w.washouts.filter((o) => o.filled < o.cells.length).length;
+  return { graded: graded / n, paved: paved / n, mounds, mud, washouts, rocksOnRoad };
 }
 
 export interface Hint { text: string; machine: Machine | null }
@@ -482,8 +597,8 @@ export function objectiveHint(g: Game): Hint {
   if (g.won) return { text: "Road complete!", machine: null };
   if (bigOnRoad) return { text: `Break ${bigOnRoad} boulder${bigOnRoad > 1 ? "s" : ""} blocking the road`, machine: "excavator" };
   if (p.rocksOnRoad) return { text: `Push ${p.rocksOnRoad} loose rock${p.rocksOnRoad > 1 ? "s" : ""} off the road`, machine: "dozer" };
-  if (p.mounds) return { text: `Dig ${p.mounds} dirt mound${p.mounds > 1 ? "s" : ""} (load the truck or dump off-road)`, machine: "excavator" };
-  if (p.mud) return { text: `Fill ${p.mud} mud hole${p.mud > 1 ? "s" : ""} with dirt`, machine: "excavator" };
+  if (p.mounds) return { text: `Dig ${p.mounds} dirt mound${p.mounds > 1 ? "s" : ""}: keep the dirt for the washouts (bucket or truck)`, machine: "excavator" };
+  if (p.washouts) return { text: `Fill ${p.washouts} washout${p.washouts > 1 ? "s" : ""} with dirt (${p.mud} load${p.mud > 1 ? "s" : ""}): excavator fills, or the truck tips it`, machine: "excavator" };
   if (p.graded < 0.95) return { text: `Grade the road: ${Math.floor(p.graded * 100)}% done`, machine: "dozer" };
   return { text: `Pave the graded road: ${Math.floor(p.paved * 100)}% done`, machine: "paver" };
 }

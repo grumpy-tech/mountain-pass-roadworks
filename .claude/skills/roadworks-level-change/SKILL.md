@@ -7,6 +7,7 @@ description: Add or change a gameplay mechanic in a Mountain Pass Roadworks leve
 
 ## Inputs
 - The requested change(s), in the user's words.
+- If the request adds a whole new map or changes where machines start, use `roadworks-new-map` instead (or as well).
 - Which level: Pass Road (`world.ts` + `RoadLevel.tsx`) or Timber Ridge (`forest.ts` + `ForestLevel.tsx`). Shared UI: `Shell.tsx`, `Minimap.tsx`, `shared.ts`, `campLayout.ts`.
 
 ## Rules

@@ -3,6 +3,9 @@
 import { findCamp, type Camp } from "./campLayout";
 import { DIFF, addDamage, burnFuel, makeEnv, wearFactor, type Collider, type Difficulty, type Env, type Fx, type FxKind } from "./shared";
 import { CELL, HALF, N, fbm, hash, nearestOnPath, smooth, vnoise } from "./world";
+import { arcLengths, pathPoint, startSlots, type StartSlot } from "./startLayout";
+
+export { pathPoint, type StartSlot };
 
 export type ForestMachine = "feller" | "grader" | "skidder" | "logtruck";
 export const FOREST_MACHINES: Record<ForestMachine, { accel: number; max: number; turn: number; label: string; nick: string; tracks: boolean }> = {
@@ -47,11 +50,7 @@ const TANKER_FILL = 3; // s spent pumping at the tank
 const TANKER_RELOAD = 10; // s at the depot before it can be sent again
 const TANKER_CALL_BELOW = 0.5; // the tanker is sent when the field tank drops under this
 const TANKER_YIELD = 5.5; // it waits for any machine this far ahead on the road
-// Machines start parked in a row beside the road, each angled 45 degrees towards it.
-const START_FROM = 8; // metres along the road from the mill where the row begins (the log truck, nearest the mill)
-const START_GAP = 7.5; // straight-line gap between parked machines
-const START_COUNT = 4;
-const PARK_OFFSET = 7.5; // metres off the road centre line
+// Machines start parked in a row beside the road (see startLayout.ts); the log truck is nearest the mill.
 
 export type TreeKind = "forest" | "marked" | "blocker";
 export interface Tree { x: number; z: number; s: number; alive: boolean; kind: TreeKind }
@@ -70,7 +69,6 @@ export interface FieldTank extends Zone { fuel: number; heading: number } // fue
 export type TankerState = "depot" | "out" | "fill" | "back";
 /** The NPC tanker: hidden at the depot, drives out along the road to the field tank, pumps, and drives back. */
 export interface Tanker { state: TankerState; s: number; timer: number; x: number; y: number; z: number; heading: number; pitch: number; speed: number; waiting: boolean; waitT: number }
-export interface StartSlot { x: number; z: number; heading: number }
 
 export interface ForestWorld {
   base: Float32Array; bump: Float32Array; rough: Float32Array; heights: Float32Array; colors: Float32Array; roadV: Uint8Array;
@@ -122,37 +120,6 @@ const cellOf = (x: number, z: number) => {
   const i = Math.floor((x + HALF) / CELL), j = Math.floor((z + HALF) / CELL);
   return i < 0 || j < 0 || i >= N || j >= N ? -1 : j * N + i;
 };
-
-/** Cumulative arc length along the route, so positions can be asked for in metres. */
-function arcLengths(path: { x: number; z: number }[]) {
-  const cum = [0];
-  for (let i = 1; i < path.length; i++) cum.push(cum[i - 1] + Math.hypot(path[i].x - path[i - 1].x, path[i].z - path[i - 1].z));
-  return cum;
-}
-
-/** The route point `s` metres from the mill, with the direction of travel (towards the cut block). */
-export function pathPoint(w: { path: { x: number; z: number }[]; cum: number[] }, s: number) {
-  const { path, cum } = w, ss = Math.max(0, Math.min(cum[cum.length - 1], s));
-  let lo = 1, hi = cum.length - 1;
-  while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid] < ss) lo = mid + 1; else hi = mid; }
-  const a = path[lo - 1], b = path[lo], f = (ss - cum[lo - 1]) / (cum[lo] - cum[lo - 1] || 1);
-  const p = path[Math.max(0, lo - 4)], q = path[Math.min(path.length - 1, lo + 3)];
-  return { x: a.x + (b.x - a.x) * f, z: a.z + (b.z - a.z) * f, heading: Math.atan2(q.x - p.x, q.z - p.z), i: lo };
-}
-
-/** A row of parking spots on the far side of the road from the camp, spaced out, each angled 45 degrees towards the road. */
-function startSlots(w: { path: { x: number; z: number }[]; cum: number[] }, camp: Camp): StartSlot[] {
-  const ref = pathPoint(w, w.cum[nearestOnPath(w.path, camp.x, camp.z).i]);
-  const campSide = Math.sign((camp.mid.x - ref.x) * Math.cos(ref.heading) - (camp.mid.z - ref.z) * Math.sin(ref.heading)) || 1;
-  const side = -campSide; // +1 = the "right" vector (cos h, -sin h) side of the road
-  const slots: StartSlot[] = [];
-  for (let s = START_FROM; slots.length < START_COUNT && s < w.cum[w.cum.length - 1]; s += 0.5) {
-    const p = pathPoint(w, s), rx = Math.cos(p.heading), rz = -Math.sin(p.heading);
-    const x = p.x + rx * side * PARK_OFFSET, z = p.z + rz * side * PARK_OFFSET, last = slots[slots.length - 1];
-    if (!last || Math.hypot(x - last.x, z - last.z) >= START_GAP) slots.push({ x, z, heading: p.heading - side * (Math.PI / 4) });
-  }
-  return slots.reverse(); // the first machine (feller) ends up furthest along the road
-}
 
 export function createForestWorld(): ForestWorld {
   const path = spline(CONTROL);
