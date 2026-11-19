@@ -1,8 +1,8 @@
-// Pure game rules: terrain generation, road job state, vehicle sim. No React / three.
-export const N = 80; // cells per side
-export const CELL = 2;
-export const HALF = (N * CELL) / 2;
-export const ROAD_HALF_WIDTH = 3.2;
+// Pure game rules: road job state, vehicle sim, per-level setup via LevelConfig. No React / three.
+// Terrain data + lookups live in grid.ts, level generators in levels/*.ts.
+import { CELL, HALF, N, cellIndex, heightAt, nearestOnPath, roadCellAt, rockOnRoad, type Rock, type RoadCell, type World } from "./grid";
+
+export * from "./grid";
 
 export type Machine = "dozer" | "excavator" | "truck" | "paver";
 export const MACHINES: Record<Machine, { accel: number; max: number; turn: number; label: string; tracks: boolean }> = {
@@ -24,178 +24,35 @@ const MAX_GRADE = 0.75; // steeper than this = can't climb
 const LEVEL_RATE = 0.7;
 const PAVE_RATE = 1.0;
 
-function hash(x: number, y: number) {
-  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
-  return s - Math.floor(s);
-}
-function vnoise(x: number, y: number) {
-  const xi = Math.floor(x), yi = Math.floor(y);
-  const xf = x - xi, yf = y - yi;
-  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
-  const a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
-  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
-}
-function fbm(x: number, y: number) {
-  let s = 0, a = 0.5, f = 1;
-  for (let i = 0; i < 4; i++) { s += vnoise(x * f, y * f) * a; f *= 2; a *= 0.5; }
-  return s;
-}
-const smooth = (a: number, b: number, x: number) => {
-  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
-  return t * t * (3 - 2 * t);
-};
-
-
-export type CellKind = "ok" | "mound" | "mud";
-export interface RoadCell { cell: number; x: number; z: number; t: number; kind: CellKind; mound: number; stage: 1 | 2 | 3; level: number; pave: number }
-export interface Rock { id: number; x: number; z: number; r: number; big: boolean; spin: number }
-
-export interface World {
-  path: { x: number; z: number }[];
-  base: Float32Array; bump: Float32Array; rough: Float32Array; heights: Float32Array;
-  colors: Float32Array;
-  road: RoadCell[]; cellToRoad: Int32Array;
-  mud: Uint8Array; mudCells: number[];
-  trees: { x: number; z: number; s: number }[];
-  boulders: { x: number; z: number; s: number }[];
-  rocks: Rock[]; rockCapacity: number; nextRockId: number;
-  dirtyTerrain: boolean; dirtyCells: Set<number>; dirtyHazards: boolean;
-}
-
-export const pathX = (t: number) => 34 * Math.sin(t * Math.PI * 2.2) + 10 * Math.sin(t * 9 + 1);
-export const pathH = (t: number) => t * 22;
-const PZ0 = HALF - 26, PZL = 2 * HALF - 52;
-
-export function createWorld(): World {
-  const path: { x: number; z: number }[] = [];
-  for (let i = 0; i <= 500; i++) { const t = i / 500; path.push({ x: pathX(t), z: PZ0 - t * PZL }); }
-  const nearest = (x: number, z: number) => nearestOnPath(path, x, z);
-  const V = (N + 1) * (N + 1);
-  const base = new Float32Array(V), bump = new Float32Array(V), rough = new Float32Array(V), colors = new Float32Array(V * 3);
-  const dist = new Float32Array(V);
-  for (let r = 0; r <= N; r++) for (let c = 0; c <= N; c++) {
-    const v = r * (N + 1) + c, x = -HALF + c * CELL, z = -HALF + r * CELL;
-    const { d, t } = nearest(x, z);
-    dist[v] = d;
-    const s = smooth(4.5, 18, d);
-    const m = fbm(x * 0.035 + 3, z * 0.035) * 24 + d * 0.25;
-    base[v] = pathH(t) + s * m;
-    bump[v] = (vnoise(x * 0.4, z * 0.4) - 0.5) * 2.2 * (1 - smooth(4, 7, d));
-    rough[v] = 1;
-  }
-  for (let r = 0; r <= N; r++) for (let c = 0; c <= N; c++) {
-    const v = r * (N + 1) + c, h = base[v], d = dist[v];
-    const rel = h - pathH(Math.min(1, Math.max(0, (PZ0 - (-HALF + r * CELL)) / PZL)));
-    let col: [number, number, number];
-    if (d < 4.6) col = [0.55, 0.42, 0.28];
-    else if (h > 40) col = [0.93, 0.95, 0.97];
-    else if (rel > 14) col = [0.5, 0.48, 0.46];
-    else if (rel > 7) col = [0.42, 0.5, 0.33];
-    else col = [0.4, 0.58, 0.3];
-    const j = 0.9 + hash(c, r) * 0.2;
-    colors.set([col[0] * j, col[1] * j, col[2] * j], v * 3);
-  }
-  const road: RoadCell[] = [];
-  const cellToRoad = new Int32Array(N * N).fill(-1);
-  const mud = new Uint8Array(N * N);
-  const trees: World["trees"] = [], boulders: World["boulders"] = [];
-  const rocks: Rock[] = [];
-  let id = 0, bigCount = 0;
-  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
-    const x = -HALF + (i + 0.5) * CELL, z = -HALF + (j + 0.5) * CELL;
-    const { d, t } = nearest(x, z);
-    const h = hash(i * 3.1, j * 7.7);
-    const mudNoise = vnoise(x * 0.12 + 9, z * 0.12);
-    if (d < ROAD_HALF_WIDTH) {
-      const early = t < 0.06; // keep the parking area clear
-      let kind: CellKind = "ok";
-      if (!early && vnoise(x * 0.15, z * 0.15 + 4) > 0.8) kind = "mound";
-      else if (!early && mudNoise > 0.86) kind = "mud";
-      cellToRoad[j * N + i] = road.length;
-      road.push({ cell: j * N + i, x, z, t, kind, mound: kind === "mound" ? 2 : 0, stage: 1, level: 0, pave: 0 });
-      if (kind === "mud") mud[j * N + i] = 1;
-      if (!early && kind === "ok") {
-        if (h > 0.965) { rocks.push({ id: id++, x, z, r: 1.4, big: true, spin: h * 9 }); bigCount++; }
-        else if (h > 0.8) rocks.push({ id: id++, x: x + (h - 0.9) * 2, z, r: 0.55 + h * 0.2, big: false, spin: h * 20 });
-      }
-    } else {
-      if (d < 6 && mudNoise > 0.7) mud[j * N + i] = 1; // off-road bog
-      else if (d > 7 && d < 22 && h > 0.9) trees.push({ x, z, s: 0.8 + hash(i, j) * 0.8 });
-      else if (d > 6 && h < 0.03) boulders.push({ x, z, s: 1 + hash(j, i) * 1.5 });
-    }
-  }
-  const mudCells: number[] = [];
-  mud.forEach((m, k) => { if (m) mudCells.push(k); });
-  const w: World = {
-    path, base, bump, rough, heights: new Float32Array(V), colors, road, cellToRoad, mud, mudCells, trees, boulders,
-    rocks, rockCapacity: rocks.length + bigCount * 3, nextRockId: id,
-    dirtyTerrain: true, dirtyCells: new Set(), dirtyHazards: true,
-  };
-  recomputeHeights(w);
-  return w;
-}
-
-export function nearestOnPath(path: { x: number; z: number }[], x: number, z: number) {
-  let best = 1e9, bi = 0;
-  for (let i = 0; i < path.length; i++) {
-    const dx = path[i].x - x, dz = path[i].z - z, d = dx * dx + dz * dz;
-    if (d < best) { best = d; bi = i; }
-  }
-  return { d: Math.sqrt(best), t: bi / (path.length - 1), i: bi };
-}
-
-export function recomputeHeights(w: World) {
-  for (let v = 0; v < w.heights.length; v++) w.heights[v] = w.base[v] + w.bump[v] * w.rough[v];
-}
-
-export function heightAt(w: World, x: number, z: number) {
-  const fx = Math.min(N - 0.001, Math.max(0, (x + HALF) / CELL)), fz = Math.min(N - 0.001, Math.max(0, (z + HALF) / CELL));
-  const c = Math.floor(fx), r = Math.floor(fz), u = fx - c, v = fz - r;
-  const H = w.heights, i = r * (N + 1) + c;
-  const a = H[i], b = H[i + 1], cc = H[i + N + 1], d = H[i + N + 2];
-  return (a * (1 - u) + b * u) * (1 - v) + (cc * (1 - u) + d * u) * v;
-}
-
-export function cellIndex(x: number, z: number) {
-  const i = Math.floor((x + HALF) / CELL), j = Math.floor((z + HALF) / CELL);
-  if (i < 0 || j < 0 || i >= N || j >= N) return -1;
-  return j * N + i;
-}
-
-export function roadCellAt(w: World, x: number, z: number): RoadCell | null {
-  const c = cellIndex(x, z);
-  if (c < 0) return null;
-  const k = w.cellToRoad[c];
-  return k < 0 ? null : w.road[k];
-}
-
-export function rockOnRoad(w: World, r: Rock) {
-  const e = r.r * 0.7;
-  return !!(roadCellAt(w, r.x, r.z) || roadCellAt(w, r.x + e, r.z) || roadCellAt(w, r.x - e, r.z) || roadCellAt(w, r.x, r.z + e) || roadCellAt(w, r.x, r.z - e));
-}
-
 export interface Vehicle {
   kind: Machine; x: number; z: number; heading: number; speed: number; pitch: number; roll: number; y: number;
   dirt: number; rock: number; // cargo (truck: up to capacity; excavator bucket: max 1 total)
   tipped: boolean; work: number; // action progress 0..1 for animation
 }
 
-export interface Game { world: World; vehicles: Vehicle[]; active: number; msg: string; msgT: number; actionT: number; won: boolean }
+export interface Game { world: World; vehicles: Vehicle[]; active: number; msg: string; msgT: number; actionT: number; won: boolean; level: LevelConfig }
 
-function makeVehicle(w: World, kind: Machine, pathIdx: number, side: number): Vehicle {
+/** Everything that differs between levels: which machines exist, how the world is generated, and the opening hint. */
+export interface LevelConfig {
+  id: string;
+  title: string;
+  blurb: string;
+  /** Short job name shown in the HUD. */
+  job: string;
+  machines: Machine[];
+  build(): { world: World; vehicles: Vehicle[]; site: null; intro: string };
+}
+
+export function makeVehicle(w: World, kind: Machine, pathIdx: number, side: number): Vehicle {
   const p = w.path[pathIdx], q = w.path[pathIdx + 3];
   const heading = Math.atan2(q.x - p.x, q.z - p.z);
   const x = p.x + Math.cos(heading) * side, z = p.z - Math.sin(heading) * side;
   return { kind, x, z, heading, speed: 0, pitch: 0, roll: 0, y: heightAt(w, x, z), dirt: 0, rock: 0, tipped: false, work: 0 };
 }
 
-export function createGame(): Game {
-  const w = createWorld();
-  const vehicles = [makeVehicle(w, "dozer", 14, 0), makeVehicle(w, "excavator", 6, -1.5), makeVehicle(w, "truck", 2, 1.8), makeVehicle(w, "paver", 22, 0)];
-  // nudge paver behind start so it isn't in the way
-  const pv = makeVehicle(w, "paver", 1, -2.2);
-  vehicles[3] = pv;
-  return { world: w, vehicles, active: 0, msg: "Push the rocks off the road with the bulldozer", msgT: 5, actionT: 0, won: false };
+export function createGame(level: LevelConfig): Game {
+  const { world, vehicles, intro } = level.build();
+  return { world, vehicles, active: 0, msg: intro, msgT: 5, actionT: 0, won: false, level };
 }
 
 export interface Input { throttle: number; steer: number; action: boolean }

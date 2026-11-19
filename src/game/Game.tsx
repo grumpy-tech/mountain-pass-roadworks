@@ -4,8 +4,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import {
   CELL, HALF, MACHINES, N, TRUCK_CAPACITY, createGame, currentAction, heightAt, progress, recomputeHeights, recover, stepGame, switchVehicle,
-  type Game as GameState, type Vehicle, type World,
+  type Game as GameState, type LevelConfig, type Vehicle, type World,
 } from "./world";
+import { MOUNTAIN_LEVEL } from "./levels/mountain";
 
 const keys = new Set<string>();
 const DIRT = new THREE.Color("#8a6a45"), ASPHALT = new THREE.Color("#3a3c40");
@@ -256,8 +257,8 @@ function Director({ game, onReady }: { game: GameState; onReady: () => void }) {
   );
 }
 
-export default function Game() {
-  const game = useMemo(() => createGame(), []);
+export default function Game({ level = MOUNTAIN_LEVEL }: { level?: LevelConfig }) {
+  const game = useMemo(() => createGame(level), [level]);
   const world = game.world;
   const [hud, setHud] = useState(() => ({ ...progress(world), active: 0, speed: 0, msg: "", action: "", actionT: 0, actionMax: 1, cargo: "", won: false }));
   const [ready, setReady] = useState(false);
