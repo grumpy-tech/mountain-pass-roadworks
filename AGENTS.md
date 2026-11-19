@@ -30,4 +30,4 @@ use the editor.
 <!-- LOVABLE:END -->
 
 ## Game architecture
-- Game rules (terrain, road job stages, vehicle sim) live in `src/game/world.ts` with no React/three imports; `src/game/Game.tsx` only renders that state and runs one `useFrame` stepper — keeps the sim testable and tweakable.
+- Game rules live in rules modules with no React/three imports: `src/game/world.ts` (Pass Road) and `src/game/forest.ts` (Timber Ridge). Each level has a render module (`RoadLevel.tsx`, `ForestLevel.tsx`) that exposes a `LevelSpec`; `src/game/Shell.tsx` runs any spec (HUD, hints, popup, audio, day/dusk, win stats) with one `useFrame` stepper. `Game.tsx` is just the level-select root. New levels = a rules module + a level module + a card in `LevelSelect.tsx`. Sound is synthesized in `audio.ts`; rules push event names onto `game.events` and the shell plays them.
