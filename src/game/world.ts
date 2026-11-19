@@ -1,4 +1,6 @@
 // Pure game rules: terrain generation, road job state, vehicle sim. No React / three.
+import { findCamp, type Camp } from "./camp";
+import { DIFF, addDamage, burnFuel, makeEnv, wearFactor, type Difficulty, type Env, type Fx, type FxKind, LOW_FUEL } from "./shared";
 export const N = 80; // cells per side
 export const CELL = 2;
 export const HALF = (N * CELL) / 2;
@@ -16,6 +18,7 @@ const DIG_TIME = 1.1;
 const LOAD_TIME = 0.6;
 const FILL_TIME = 0.8;
 const DUMP_TIME = 1.2;
+const REFUEL_TIME = 2;
 const VEH_RADIUS = 1.7;
 const TIP_ROLL = 0.5;
 const TIP_PITCH = 0.6;
@@ -59,6 +62,7 @@ export interface World {
   trees: { x: number; z: number; s: number }[];
   boulders: { x: number; z: number; s: number }[];
   rocks: Rock[]; rockCapacity: number; nextRockId: number;
+  camp: Camp;
   dirtyTerrain: boolean; dirtyCells: Set<number>; dirtyHazards: boolean;
 }
 
@@ -70,6 +74,9 @@ export function createWorld(): World {
   const path: { x: number; z: number }[] = [];
   for (let i = 0; i <= 500; i++) { const t = i / 500; path.push({ x: pathX(t), z: PZ0 - t * PZL }); }
   const nearest = (x: number, z: number) => nearestOnPath(path, x, z);
+  const camp = findCamp(path, "PASS ROAD WORKS");
+  const nearCamp = (x: number, z: number, r: number) => Math.hypot(x - camp.mid.x, z - camp.mid.z) < r;
+  const campT = nearestOnPath(path, camp.x, camp.z).t;
   const V = (N + 1) * (N + 1);
   const base = new Float32Array(V), bump = new Float32Array(V), rough = new Float32Array(V), colors = new Float32Array(V * 3);
   const dist = new Float32Array(V);
@@ -79,7 +86,8 @@ export function createWorld(): World {
     dist[v] = d;
     const s = smooth(4.5, 18, d);
     const m = fbm(x * 0.035 + 3, z * 0.035) * 24 + d * 0.25;
-    base[v] = pathH(t) + s * m;
+    const plateau = 1 - smooth(21, 34, Math.hypot(x - camp.mid.x, z - camp.mid.z)); // level ground under the camp
+    base[v] = (pathH(t) + s * m) * (1 - plateau) + pathH(campT) * plateau;
     bump[v] = (vnoise(x * 0.4, z * 0.4) - 0.5) * 2.2 * (1 - smooth(4, 7, d));
     rough[v] = 1;
   }
@@ -92,6 +100,7 @@ export function createWorld(): World {
     else if (rel > 14) col = [0.5, 0.48, 0.46];
     else if (rel > 7) col = [0.42, 0.5, 0.33];
     else col = [0.4, 0.58, 0.3];
+    if (nearCamp(-HALF + c * CELL, -HALF + r * CELL, 26) && d > 4.6) col = [0.55, 0.5, 0.42]; // gravel yard
     const j = 0.9 + hash(c, r) * 0.2;
     colors.set([col[0] * j, col[1] * j, col[2] * j], v * 3);
   }
@@ -107,7 +116,7 @@ export function createWorld(): World {
     const h = hash(i * 3.1, j * 7.7);
     const mudNoise = vnoise(x * 0.12 + 9, z * 0.12);
     if (d < ROAD_HALF_WIDTH) {
-      const early = t < 0.06; // keep the parking area clear
+      const early = t < 0.06 || nearCamp(x, z, 26); // keep the camp and parking area clear
       let kind: CellKind = "ok";
       if (!early && vnoise(x * 0.15, z * 0.15 + 4) > 0.8) kind = "mound";
       else if (!early && mudNoise > 0.86) kind = "mud";
@@ -118,6 +127,8 @@ export function createWorld(): World {
         if (h > 0.965) { rocks.push({ id: id++, x, z, r: 1.4, big: true, spin: h * 9 }); bigCount++; }
         else if (h > 0.8) rocks.push({ id: id++, x: x + (h - 0.9) * 2, z, r: 0.55 + h * 0.2, big: false, spin: h * 20 });
       }
+    } else if (nearCamp(x, z, 28)) {
+      // camp yard: no scenery
     } else {
       if (d < 6 && mudNoise > 0.7) mud[j * N + i] = 1; // off-road bog
       else if (d > 7 && d < 22 && h > 0.9) trees.push({ x, z, s: 0.8 + hash(i, j) * 0.8 });
@@ -128,7 +139,7 @@ export function createWorld(): World {
   mud.forEach((m, k) => { if (m) mudCells.push(k); });
   const w: World = {
     path, base, bump, rough, heights: new Float32Array(V), colors, road, cellToRoad, mud, mudCells, trees, boulders,
-    rocks, rockCapacity: rocks.length + bigCount * 3, nextRockId: id,
+    rocks, rockCapacity: rocks.length + bigCount * 3, nextRockId: id, camp,
     dirtyTerrain: true, dirtyCells: new Set(), dirtyHazards: true,
   };
   recomputeHeights(w);
@@ -178,6 +189,7 @@ export interface Vehicle {
   kind: Machine; x: number; z: number; heading: number; speed: number; pitch: number; roll: number; y: number;
   dirt: number; rock: number; // cargo (truck: up to capacity; excavator bucket: max 1 total)
   tipped: boolean; work: number; // action progress 0..1 for animation
+  fuel: number; damage: number; // 0..1 tank, 0..1 wear
 }
 
 /** One-shot happenings the renderer/audio layer drains each frame. */
@@ -185,29 +197,32 @@ export type GameEvent = "switch" | "tip" | "break" | "dig" | "load" | "dump" | "
 
 export interface Game {
   world: World; vehicles: Vehicle[]; active: number; msg: string; msgT: number; actionT: number; won: boolean;
-  time: number; rollovers: number; events: GameEvent[];
+  time: number; rollovers: number; events: GameEvent[]; fx: Fx[]; env: Env;
 }
 
 function makeVehicle(w: World, kind: Machine, pathIdx: number, side: number): Vehicle {
   const p = w.path[pathIdx], q = w.path[pathIdx + 3];
   const heading = Math.atan2(q.x - p.x, q.z - p.z);
   const x = p.x + Math.cos(heading) * side, z = p.z - Math.sin(heading) * side;
-  return { kind, x, z, heading, speed: 0, pitch: 0, roll: 0, y: heightAt(w, x, z), dirt: 0, rock: 0, tipped: false, work: 0 };
+  return { kind, x, z, heading, speed: 0, pitch: 0, roll: 0, y: heightAt(w, x, z), dirt: 0, rock: 0, tipped: false, work: 0, fuel: 1, damage: 0 };
 }
 
-export function createGame(): Game {
+export function createGame(diff: Difficulty = "normal"): Game {
   const w = createWorld();
   const vehicles = [makeVehicle(w, "dozer", 14, 0), makeVehicle(w, "excavator", 6, -1.5), makeVehicle(w, "truck", 2, 1.8), makeVehicle(w, "paver", 22, 0)];
   // nudge paver behind start so it isn't in the way
   const pv = makeVehicle(w, "paver", 1, -2.2);
   vehicles[3] = pv;
-  return { world: w, vehicles, active: 0, msg: "Push the rocks off the road with the bulldozer", msgT: 5, actionT: 0, won: false, time: 0, rollovers: 0, events: [] };
+  return { world: w, vehicles, active: 0, msg: "Push the rocks off the road with the bulldozer", msgT: 5, actionT: 0, won: false, time: 0, rollovers: 0, events: [], fx: [], env: makeEnv(diff) };
 }
 
 export interface Input { throttle: number; steer: number; action: boolean }
 
 function say(g: Game, m: string) { g.msg = m; g.msgT = 2.5; }
 function emit(g: Game, e: GameEvent) { if (g.events.length < 32) g.events.push(e); }
+function puff(g: Game, kind: FxKind, x: number, z: number, n = 8, extra: Partial<Fx> = {}) {
+  if (g.fx.length < 64) g.fx.push({ kind, x, y: heightAt(g.world, x, z), z, n, ...extra });
+}
 
 function setLevel(w: World, rc: RoadCell, level: number) {
   rc.level = level;
@@ -229,15 +244,20 @@ function surfaceGrip(w: World, v: Vehicle) {
   return rc.stage === 1 ? 0.75 : rc.stage === 2 ? 0.9 : 1;
 }
 
-function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: number) {
-  const w = g.world, M = MACHINES[v.kind];
+function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: number, me: boolean) {
+  const w = g.world, M = MACHINES[v.kind], D = DIFF[g.env.diff];
   if (v.tipped) { throttle = 0; steer = 0; }
+  if (me && !v.tipped) burnFuel(v, dt, throttle, g.actionT > 0, g.env.diff);
+  if (v.fuel <= 0) {
+    if (me && throttle !== 0 && g.msgT <= 0) say(g, "Out of fuel! Press R to be towed back to camp (+20 s)");
+    throttle = 0;
+  }
   const fx = Math.sin(v.heading), fz = Math.cos(v.heading);
-  const grip = surfaceGrip(w, v);
+  const grip = Math.min(1.15, surfaceGrip(w, v) * g.env.gripMul * D.grip);
   const loadFactor = v.kind === "truck" ? 1 - ((v.dirt + v.rock) / TRUCK_CAPACITY) * 0.35 : 1;
   v.speed += throttle * M.accel * loadFactor * dt;
   v.speed *= Math.exp(-DRAG * (throttle === 0 ? 1.5 : 0.3) * dt);
-  const maxS = M.max * grip;
+  const maxS = M.max * grip * wearFactor(v);
   v.speed = Math.max(-maxS * 0.5, Math.min(maxS, v.speed));
   v.heading += steer * M.turn * dt * Math.min(1, Math.abs(v.speed) / 1.5 + 0.35) * (v.speed < -0.1 ? -1 : 1);
   const nx = v.x + fx * v.speed * dt, nz = v.z + fz * v.speed * dt;
@@ -251,6 +271,10 @@ function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: n
     if (o === v) continue;
     const d0 = Math.hypot(o.x - v.x, o.z - v.z), d1 = Math.hypot(o.x - nx, o.z - nz);
     if (d1 < VEH_RADIUS * 2 && d1 < d0) { blocked = true; break; }
+  }
+  if (!blocked) for (const c of w.camp.colliders) { // cabins, parked cars, tank...
+    const d0 = Math.hypot(c.x - v.x, c.z - v.z), d1 = Math.hypot(c.x - nx, c.z - nz);
+    if (d1 < VEH_RADIUS * 0.9 + c.r && d1 < d0) { blocked = true; break; }
   }
   // rocks: the dozer blade pushes small rocks, everything else is an obstacle
   if (!blocked) for (const r of w.rocks) {
@@ -268,8 +292,11 @@ function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: n
     }
     if (Math.hypot(dx, dz) < VEH_RADIUS + r.r * 0.8 && Math.hypot(r.x - v.x, r.z - v.z) > Math.hypot(dx, dz)) { blocked = true; break; }
   }
-  if (blocked) v.speed *= -0.2;
-  else {
+  if (blocked) {
+    const hit = Math.abs(v.speed);
+    if (hit > 2.5) { addDamage(v, Math.min(0.08, hit * 0.01)); emit(g, "dig"); puff(g, "dust", nx, nz, 5); }
+    v.speed *= -0.2;
+  } else {
     if (grade > 0) v.speed *= Math.exp(-grade * 2.5 * dt);
     v.x = nx; v.z = nz;
   }
@@ -283,9 +310,9 @@ function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: n
   else {
     v.pitch += (tp - v.pitch) * k; v.roll += (trl - v.roll) * k;
     const topHeavy = v.kind === "truck" ? 1 + (v.dirt + v.rock) / TRUCK_CAPACITY * 0.4 : 1;
-    if (Math.abs(v.roll) * topHeavy > TIP_ROLL || Math.abs(v.pitch) > TIP_PITCH) {
+    if (Math.abs(v.roll) * topHeavy > TIP_ROLL * D.tip || Math.abs(v.pitch) > TIP_PITCH * D.tip) {
       v.tipped = true; v.speed = 0;
-      g.rollovers++; emit(g, "tip");
+      g.rollovers++; addDamage(v, 0.2); emit(g, "tip"); puff(g, "dust", v.x, v.z, 14);
       if (g.vehicles[g.active] === v) say(g, "Rolled over! Press R to recover");
     }
   }
@@ -319,6 +346,10 @@ export function currentAction(g: Game): Action {
   if (v.tipped) return null;
   const fx = Math.sin(v.heading), fz = Math.cos(v.heading);
   const px = v.x + fx * 3.2, pz = v.z + fz * 3.2; // reach point
+  const pump = w.camp.fuel;
+  if (Math.hypot(v.x - pump.x, v.z - pump.z) < pump.r && (v.fuel < 0.97 || v.damage > 0.03)) {
+    return { label: "Refuel & repair", time: REFUEL_TIME, run: () => { v.fuel = 1; v.damage = 0; emit(g, "load"); say(g, "Tank full, machine repaired"); } };
+  }
   if (v.kind === "excavator") {
     const held = v.dirt + v.rock;
     if (held === 0) {
@@ -327,35 +358,37 @@ export function currentAction(g: Game): Action {
       if (best) {
         const r = best;
         if (r.big) return { label: "Break boulder", time: DIG_TIME * 2, run: () => {
-          emit(g, "break");
+          emit(g, "break"); puff(g, "chips", r.x, r.z, 18); puff(g, "dust", r.x, r.z, 10);
           w.rocks.splice(w.rocks.indexOf(r), 1);
           for (let i = 0; i < 3; i++) {
             const a = (i / 3) * Math.PI * 2 + r.spin;
             w.rocks.push({ id: w.nextRockId++, x: r.x + Math.cos(a) * 1.1, z: r.z + Math.sin(a) * 1.1, r: 0.6, big: false, spin: a });
           }
         } };
-        return { label: "Pick up rock", time: DIG_TIME, run: () => { emit(g, "dig"); w.rocks.splice(w.rocks.indexOf(r), 1); v.rock = 1; } };
+        return { label: "Pick up rock", time: DIG_TIME, run: () => { emit(g, "dig"); puff(g, "dust", r.x, r.z, 8); w.rocks.splice(w.rocks.indexOf(r), 1); v.rock = 1; } };
       }
       let mc: RoadCell | null = null; let md = 3.2;
       for (const rc of w.road) if (rc.kind === "mound") { const d = Math.hypot(rc.x - px, rc.z - pz); if (d < md) { md = d; mc = rc; } }
       if (mc) {
         const c = mc;
         return { label: "Dig dirt mound", time: DIG_TIME, run: () => {
-          emit(g, "dig"); c.mound -= 1; v.dirt = 1;
+          emit(g, "dig"); puff(g, "dirt", c.x, c.z, 12); c.mound -= 1; v.dirt = 1;
           if (c.mound <= 0) { c.kind = "ok"; }
           w.dirtyHazards = true;
         } };
       }
+      const hole = roadCellAt(w, px, pz);
+      if (hole && hole.kind === "mud") return { label: "Hole needs dirt: dig a mound first", time: Infinity, run: () => {} };
       return null;
-    }
-    const truck = g.vehicles.find((o) => o.kind === "truck" && Math.hypot(o.x - px, o.z - pz) < 4 && !o.tipped);
-    if (truck) {
-      if (truck.dirt + truck.rock >= TRUCK_CAPACITY) return { label: "Truck is full", time: Infinity, run: () => {} };
-      return { label: "Load into truck", time: LOAD_TIME, run: () => { emit(g, "load"); truck.dirt += v.dirt; truck.rock += v.rock; v.dirt = 0; v.rock = 0; } };
     }
     const rc = roadCellAt(w, px, pz);
     if (rc && rc.kind === "mud" && v.dirt) return { label: "Fill mud hole", time: FILL_TIME, run: () => fillMud(g, rc, () => { v.dirt = 0; }) };
-    if (!rc) return { label: "Dump bucket here", time: LOAD_TIME, run: () => { emit(g, "dump"); v.dirt = 0; v.rock = 0; } };
+    const truck = g.vehicles.find((o) => o.kind === "truck" && Math.hypot(o.x - px, o.z - pz) < 4 && !o.tipped);
+    if (truck) {
+      if (truck.dirt + truck.rock >= TRUCK_CAPACITY) return { label: "Truck is full", time: Infinity, run: () => {} };
+      return { label: "Load into truck", time: LOAD_TIME, run: () => { emit(g, "load"); puff(g, "dust", truck.x, truck.z, 8); truck.dirt += v.dirt; truck.rock += v.rock; v.dirt = 0; v.rock = 0; } };
+    }
+    if (!rc) return { label: "Dump bucket here", time: LOAD_TIME, run: () => { emit(g, "dump"); puff(g, "dirt", px, pz, 12); v.dirt = 0; v.rock = 0; } };
     return { label: "Swing to a truck or off the road to dump", time: Infinity, run: () => {} };
   }
   if (v.kind === "truck") {
@@ -364,7 +397,7 @@ export function currentAction(g: Game): Action {
     const bx = v.x - fx * 2.5, bz = v.z - fz * 2.5; // tips out the back
     const rc = roadCellAt(w, bx, bz);
     if (rc && rc.kind === "mud" && v.dirt > 0) return { label: "Tip dirt into mud", time: FILL_TIME, run: () => fillMud(g, rc, () => { v.dirt -= 1; }) };
-    if (!rc && !roadCellAt(w, v.x, v.z)) return { label: `Dump load (${load})`, time: DUMP_TIME, run: () => { emit(g, "dump"); v.dirt = 0; v.rock = 0; } };
+    if (!rc && !roadCellAt(w, v.x, v.z)) return { label: `Dump load (${load})`, time: DUMP_TIME, run: () => { emit(g, "dump"); puff(g, "dirt", bx, bz, 20); v.dirt = 0; v.rock = 0; } };
     return { label: v.dirt > 0 ? "Back up to mud, or drive off-road to dump" : "Drive off-road to dump rocks", time: Infinity, run: () => {} };
   }
   return null;
@@ -373,12 +406,15 @@ export function currentAction(g: Game): Action {
 function fillMud(g: Game, rc: RoadCell, spend: () => void) {
   const w = g.world;
   emit(g, "fill"); rc.kind = "ok"; w.mud[rc.cell] = 0; spend(); w.dirtyHazards = true;
+  puff(g, "splash", rc.x, rc.z, 16); puff(g, "dirt", rc.x, rc.z, 12);
+  const left = w.road.filter((r) => r.kind === "mud").length;
+  say(g, left ? `Mud hole filled: ${left} left` : "Last mud hole filled!");
 }
 
 export function stepGame(g: Game, inp: Input, dt: number) {
   g.vehicles.forEach((v, i) => {
     const me = i === g.active;
-    stepVehicle(g, v, me ? inp.throttle : 0, me ? inp.steer : 0, dt);
+    stepVehicle(g, v, me ? inp.throttle : 0, me ? inp.steer : 0, dt, me);
   });
   const v = g.vehicles[g.active];
   const act = inp.action ? currentAction(g) : null;
@@ -410,6 +446,13 @@ export function cycleVehicle(g: Game, dir: 1 | -1 = 1) {
 
 export function recover(g: Game) {
   const v = g.vehicles[g.active], w = g.world;
+  if (v.fuel <= 0) { // out of fuel: tow to the pump, with a time penalty
+    const c = w.camp.fuel, n = nearestOnPath(w.path, c.x, c.z), q = w.path[Math.min(w.path.length - 1, n.i + 3)];
+    v.x = c.x; v.z = c.z; v.heading = Math.atan2(q.x - w.path[n.i].x, q.z - w.path[n.i].z);
+    v.fuel = 0.3; v.tipped = false; v.roll = 0; v.pitch = 0; v.speed = 0; g.time += 20;
+    say(g, "Towed back to camp (+20 s)");
+    return;
+  }
   const n = nearestOnPath(w.path, v.x, v.z);
   const p = w.path[n.i], q = w.path[Math.min(w.path.length - 1, n.i + 3)];
   if (v.tipped || n.d > 6) { v.x = p.x; v.z = p.z; v.heading = Math.atan2(q.x - p.x, q.z - p.z); }
@@ -443,4 +486,31 @@ export function objectiveHint(g: Game): Hint {
   if (p.mud) return { text: `Fill ${p.mud} mud hole${p.mud > 1 ? "s" : ""} with dirt`, machine: "excavator" };
   if (p.graded < 0.95) return { text: `Grade the road: ${Math.floor(p.graded * 100)}% done`, machine: "dozer" };
   return { text: `Pave the graded road: ${Math.floor(p.paved * 100)}% done`, machine: "paver" };
+}
+
+/** Length of the route in metres. */
+export function pathLength(w: World) {
+  let L = 0;
+  for (let i = 1; i < w.path.length; i++) L += Math.hypot(w.path[i].x - w.path[i - 1].x, w.path[i].z - w.path[i - 1].z);
+  return L;
+}
+
+const orderCache = new WeakMap<World, RoadCell[]>();
+
+/**
+ * How far along the route the work has got, as unbroken stretches from the camp end:
+ * the grading front stops at the first ungraded cell, the paving front at the first unpaved one.
+ */
+export function roadFrontier(w: World) {
+  let order = orderCache.get(w);
+  if (!order) { order = [...w.road].sort((a, b) => a.t - b.t); orderCache.set(w, order); }
+  const frontier = (done: (r: RoadCell) => boolean) => {
+    let t = 1;
+    for (const r of order!) if (!done(r)) { t = r.t; break; }
+    const i = Math.max(0, Math.min(w.path.length - 1, Math.round(t * (w.path.length - 1))));
+    return { t, ...w.path[i] };
+  };
+  const total = pathLength(w);
+  const g = frontier((r) => r.stage >= 2), p = frontier((r) => r.stage === 3);
+  return { total, graded: { ...g, m: g.t * total }, paved: { ...p, m: p.t * total } };
 }
