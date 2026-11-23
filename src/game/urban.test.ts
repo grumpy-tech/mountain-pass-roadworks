@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { URBAN_LEVEL, URBAN_SITE } from "./levels/urban";
+import { URBAN_LEVEL, URBAN_PUMP, URBAN_SITE } from "./levels/urban";
 import { PALLETS, cellCenter, craneHint, foundationDone, hookedPallet, stars, structureTop, toggleHook, type Pallet, type Site } from "./site";
-import { createGame, craneAction, currentAction, heightAt, recover, stepGame, switchVehicle, type Game } from "./urbanSim";
+import { createGame, craneAction, currentAction, cycleVehicle, heightAt, recover, selectVehicle, stepGame, switchVehicle, type Game } from "./urbanSim";
 
 const idle = { throttle: 0, steer: 0, action: false };
 const run = (g: Game, secs: number) => { for (let t = 0; t < secs; t += 1 / 60) stepGame(g, idle, 1 / 60); };
@@ -267,5 +267,86 @@ describe("controls on site", () => {
     buildFoundation(g);
     expect(craneHint(s, false)).toMatch(/press E/);
     expect(craneHint(s, true)).toMatch(/Waiting|hook/i);
+  });
+
+  describe("shell rules (fuel, wear, weather, difficulty, switching)", () => {
+    const drive = (g: Game, secs: number) => { for (let t = 0; t < secs; t += 1 / 60) stepGame(g, { throttle: 1, steer: 0, action: false }, 1 / 60); };
+
+    it("only the machine being driven burns fuel, and the tank is a solid refuelling point", () => {
+      const g = createGame(URBAN_LEVEL);
+      drive(g, 10);
+      expect(g.vehicles[0].fuel).toBeLessThan(1);
+      expect(g.vehicles[1].fuel).toBe(1);
+      expect(g.pump).toEqual(URBAN_PUMP);
+      const v = g.vehicles[0];
+      v.x = URBAN_PUMP.x - 5; v.z = URBAN_PUMP.z; v.heading = Math.PI / 2; v.speed = 0; v.fuel = 0.4; v.damage = 0.3;
+      expect(currentAction(g)?.label).toBe("Refuel & repair");
+      currentAction(g)!.run();
+      expect(v.fuel).toBe(1);
+      expect(v.damage).toBe(0);
+      // drive straight at the tank: it blocks instead of letting the machine through
+      v.x = URBAN_PUMP.x - 6; v.speed = 0; v.fuel = 1;
+      drive(g, 8);
+      expect(Math.hypot(v.x - URBAN_PUMP.x, v.z - URBAN_PUMP.z)).toBeGreaterThan(1.6);
+    });
+
+    it("an empty tank stops the machine until it is towed to the tank (+20 s)", () => {
+      const g = createGame(URBAN_LEVEL), v = g.vehicles[0];
+      v.fuel = 0;
+      const x0 = v.x, z0 = v.z;
+      drive(g, 3);
+      expect(Math.hypot(v.x - x0, v.z - z0)).toBeLessThan(0.1);
+      const t0 = g.time;
+      recover(g);
+      expect(Math.hypot(v.x - URBAN_PUMP.x, v.z - URBAN_PUMP.z)).toBeLessThan(URBAN_PUMP.r);
+      expect(v.fuel).toBeGreaterThan(0);
+      expect(g.time - t0).toBeGreaterThanOrEqual(20);
+    });
+
+    it("wear slows a machine, and bad weather or hard difficulty cut traction", () => {
+      const reach = (setup: (g: Game) => void) => { const g = createGame(URBAN_LEVEL, "normal"); setup(g); g.active = 1; const v = g.vehicles[1]; v.x = 32; v.z = -30; v.heading = -Math.PI / 2; drive(g, 6); return v.speed; };
+      const base = reach(() => {});
+      expect(reach((g) => { g.vehicles[1].damage = 1; })).toBeLessThan(base);
+      expect(reach((g) => { g.env.gripMul = 0.7; })).toBeLessThan(base);
+      expect(reach((g) => { g.env.diff = "hard"; })).toBeLessThan(base);
+    });
+
+    it("counts game time until the tower tops out", () => {
+      const g = createGame(URBAN_LEVEL);
+      run(g, 5);
+      expect(g.time).toBeCloseTo(5, 0);
+      g.won = true;
+      run(g, 5);
+      expect(g.time).toBeCloseTo(5, 0);
+    });
+
+    it("Tab / number keys jump to any machine, and leaving the crane returns to the last driver", () => {
+      const g = createGame(URBAN_LEVEL);
+      selectVehicle(g, 2); // the crane, from across the lot
+      expect(g.vehicles[g.active].kind).toBe("crane");
+      expect(g.prevActive).toBe(0);
+      switchVehicle(g);
+      expect(g.active).toBe(0);
+      cycleVehicle(g, -1);
+      expect(g.vehicles[g.active].kind).toBe("crane");
+      expect(g.events).toContain("switch");
+    });
+
+    it("rule events and fx are queued for the shell to drain", () => {
+      const g = createGame(URBAN_LEVEL), s = g.site!;
+      g.active = 0; reachAt(g, 0, cellCenter(s.pitCells[0]).x, cellCenter(s.pitCells[0]).z);
+      doAction(g);
+      expect(g.events).toContain("dig");
+      expect(g.fx.length).toBeGreaterThan(0);
+    });
+
+    it("machines start parked apart on level ground and stay put", () => {
+      const g = createGame(URBAN_LEVEL);
+      run(g, 3);
+      g.vehicles.forEach((a, i) => {
+        expect(a.tipped).toBe(false);
+        for (const b of g.vehicles.slice(i + 1)) expect(Math.hypot(a.x - b.x, a.z - b.z)).toBeGreaterThan(5);
+      });
+    });
   });
 });

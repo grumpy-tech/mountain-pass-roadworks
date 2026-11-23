@@ -2,18 +2,19 @@
 // Terrain data + lookups live in grid.ts, level generators in levels/*.ts.
 import { CELL, HALF, N, cellIndex, heightAt, nearestOnPath, roadCellAt, rockOnRoad, type Rock, type RoadCell, type World } from "./grid";
 import type { CraneInput } from "./crane";
+import { DIFF, addDamage, burnFuel, makeEnv, wearFactor, type Difficulty, type Env, type Fx, type FxKind } from "./shared";
 import { PALLETS, buildingStarted, digCell, haulSpoil, hookedPallet, inSpoilZone, nextDigCell, pickTarget, solidAt, stepSite, toggleHook, type Site } from "./site";
 
 export * from "./grid";
 
 export type Machine = "dozer" | "excavator" | "truck" | "paver" | "crane";
-export const MACHINES: Record<Machine, { accel: number; max: number; turn: number; label: string; tracks: boolean }> = {
-  dozer: { accel: 2.2, max: 5.5, turn: 1.1, label: "Bulldozer", tracks: true },
-  excavator: { accel: 1.6, max: 3.5, turn: 1.0, label: "Excavator", tracks: true },
-  truck: { accel: 3.2, max: 9, turn: 1.2, label: "Dump Truck", tracks: false },
-  paver: { accel: 1.6, max: 4, turn: 0.9, label: "Paver", tracks: true },
+export const MACHINES: Record<Machine, { accel: number; max: number; turn: number; label: string; nick: string; tracks: boolean }> = {
+  dozer: { accel: 2.2, max: 5.5, turn: 1.1, label: "Bulldozer", nick: "Bruiser", tracks: true },
+  excavator: { accel: 1.6, max: 3.5, turn: 1.0, label: "Excavator", nick: "Scoop", tracks: true },
+  truck: { accel: 3.2, max: 9, turn: 1.2, label: "Dump Truck", nick: "Rumble", tracks: false },
+  paver: { accel: 1.6, max: 4, turn: 0.9, label: "Paver", nick: "Smooth", tracks: true },
   // the tower crane never drives; "hopping in" hands the controls to site.crane
-  crane: { accel: 0, max: 0, turn: 0, label: "Tower Crane", tracks: false },
+  crane: { accel: 0, max: 0, turn: 0, label: "Tower Crane", nick: "Skyhook", tracks: false },
 };
 export const TRUCK_CAPACITY = 6;
 const DIG_TIME = 1.1;
@@ -27,12 +28,21 @@ const DRAG = 1.4;
 const MAX_GRADE = 0.75; // steeper than this = can't climb
 const LEVEL_RATE = 0.7;
 const PAVE_RATE = 1.0;
+const REFUEL_TIME = 2.5;
+const TOW_PENALTY = 20; // seconds added to the clock when a machine is towed back for fuel
 
 export interface Vehicle {
   kind: Machine; x: number; z: number; heading: number; speed: number; pitch: number; roll: number; y: number;
   dirt: number; rock: number; // cargo (truck: up to capacity; excavator bucket: max 1 total)
   tipped: boolean; work: number; // action progress 0..1 for animation
+  fuel: number; damage: number; // 0..1 tank, 0..1 wear
 }
+
+/** The site fuel tank: machines within `r` can refuel and repair; it is also a solid obstacle. */
+export interface Pump { x: number; z: number; r: number }
+
+/** One-shot happenings the renderer/audio layer drains each frame. */
+export type GameEvent = "switch" | "tip" | "dig" | "load" | "dump" | "hook" | "win";
 
 export interface Game {
   world: World; vehicles: Vehicle[]; active: number; msg: string; msgT: number; actionT: number; won: boolean; level: LevelConfig;
@@ -41,6 +51,9 @@ export interface Game {
   /** Machine to return to when leaving the crane. */
   prevActive: number;
   cam: "overview" | "cab";
+  /** Site fuel tank, or null on levels without one. */
+  pump: Pump | null;
+  time: number; rollovers: number; events: GameEvent[]; fx: Fx[]; env: Env;
 }
 
 /** Everything that differs between levels: which machines exist, how the world is generated, and the opening hint. */
@@ -51,29 +64,36 @@ export interface LevelConfig {
   /** Short job name shown in the HUD. */
   job: string;
   machines: Machine[];
-  build(): { world: World; vehicles: Vehicle[]; site: Site | null; intro: string };
+  build(): { world: World; vehicles: Vehicle[]; site: Site | null; intro: string; pump?: Pump };
 }
 
 export function makeVehicle(w: World, kind: Machine, pathIdx: number, side: number): Vehicle {
   const p = w.path[pathIdx], q = w.path[pathIdx + 3];
   const heading = Math.atan2(q.x - p.x, q.z - p.z);
   const x = p.x + Math.cos(heading) * side, z = p.z - Math.sin(heading) * side;
-  return { kind, x, z, heading, speed: 0, pitch: 0, roll: 0, y: heightAt(w, x, z), dirt: 0, rock: 0, tipped: false, work: 0 };
+  return { kind, x, z, heading, speed: 0, pitch: 0, roll: 0, y: heightAt(w, x, z), dirt: 0, rock: 0, tipped: false, work: 0, fuel: 1, damage: 0 };
 }
 
 export function spawnVehicle(w: World, kind: Machine, x: number, z: number, heading: number): Vehicle {
-  return { kind, x, z, heading, speed: 0, pitch: 0, roll: 0, y: heightAt(w, x, z), dirt: 0, rock: 0, tipped: false, work: 0 };
+  return { kind, x, z, heading, speed: 0, pitch: 0, roll: 0, y: heightAt(w, x, z), dirt: 0, rock: 0, tipped: false, work: 0, fuel: 1, damage: 0 };
 }
 
-export function createGame(level: LevelConfig): Game {
-  const { world, vehicles, site, intro } = level.build();
-  return { world, vehicles, active: 0, msg: intro, msgT: 5, actionT: 0, won: false, level, site, prevActive: 0, cam: "overview" };
+export function createGame(level: LevelConfig, diff: Difficulty = "normal"): Game {
+  const { world, vehicles, site, intro, pump } = level.build();
+  return {
+    world, vehicles, active: 0, msg: intro, msgT: 5, actionT: 0, won: false, level, site, prevActive: 0, cam: "overview", pump: pump ?? null,
+    time: 0, rollovers: 0, events: [], fx: [], env: makeEnv(diff),
+  };
 }
 
 /** Driving: throttle/steer. Crane: throttle = trolley out/in, steer = slew, lift = hoist up/down. */
 export interface Input { throttle: number; steer: number; action: boolean; lift?: number }
 
 function say(g: Game, m: string) { g.msg = m; g.msgT = 2.5; }
+function emit(g: Game, e: GameEvent) { if (g.events.length < 32) g.events.push(e); }
+function puff(g: Game, kind: FxKind, x: number, z: number, n = 8) {
+  if (g.fx.length < 64) g.fx.push({ kind, x, y: heightAt(g.world, x, z), z, n });
+}
 
 function setLevel(w: World, rc: RoadCell, level: number) {
   rc.level = level;
@@ -95,15 +115,20 @@ function surfaceGrip(w: World, v: Vehicle) {
   return rc.stage === 1 ? 0.75 : rc.stage === 2 ? 0.9 : 1;
 }
 
-function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: number) {
-  const w = g.world, M = MACHINES[v.kind];
+function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: number, me: boolean) {
+  const w = g.world, M = MACHINES[v.kind], D = DIFF[g.env.diff];
   if (v.tipped) { throttle = 0; steer = 0; }
+  if (me && !v.tipped) burnFuel(v, dt, throttle, g.actionT > 0, g.env.diff);
+  if (v.fuel <= 0) {
+    if (me && throttle !== 0 && g.msgT <= 0) say(g, `Out of fuel! Press R to be towed to the tank (+${TOW_PENALTY} s)`);
+    throttle = 0;
+  }
   const fx = Math.sin(v.heading), fz = Math.cos(v.heading);
-  const grip = surfaceGrip(w, v);
+  const grip = Math.min(1.15, surfaceGrip(w, v) * g.env.gripMul * D.grip);
   const loadFactor = v.kind === "truck" ? 1 - ((v.dirt + v.rock) / TRUCK_CAPACITY) * 0.35 : 1;
   v.speed += throttle * M.accel * loadFactor * dt;
   v.speed *= Math.exp(-DRAG * (throttle === 0 ? 1.5 : 0.3) * dt);
-  const maxS = M.max * grip;
+  const maxS = M.max * grip * wearFactor(v);
   v.speed = Math.max(-maxS * 0.5, Math.min(maxS, v.speed));
   v.heading += steer * M.turn * dt * Math.min(1, Math.abs(v.speed) / 1.5 + 0.35) * (v.speed < -0.1 ? -1 : 1);
   const nx = v.x + fx * v.speed * dt, nz = v.z + fz * v.speed * dt;
@@ -119,6 +144,10 @@ function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: n
     if (d1 < VEH_RADIUS * 2 && d1 < d0) { blocked = true; break; }
   }
   if (!blocked && g.site && solidAt(g.site, nx, nz)) blocked = true;
+  if (!blocked && g.pump) { // the fuel tank is solid
+    const d0 = Math.hypot(g.pump.x - v.x, g.pump.z - v.z), d1 = Math.hypot(g.pump.x - nx, g.pump.z - nz);
+    if (d1 < VEH_RADIUS * 0.9 + 1.6 && d1 < d0) blocked = true;
+  }
   // rocks: the dozer blade pushes small rocks, everything else is an obstacle
   if (!blocked) for (const r of w.rocks) {
     const dx = r.x - nx, dz = r.z - nz;
@@ -135,8 +164,11 @@ function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: n
     }
     if (Math.hypot(dx, dz) < VEH_RADIUS + r.r * 0.8 && Math.hypot(r.x - v.x, r.z - v.z) > Math.hypot(dx, dz)) { blocked = true; break; }
   }
-  if (blocked) v.speed *= -0.2;
-  else {
+  if (blocked) {
+    const hit = Math.abs(v.speed);
+    if (hit > 2.5) { addDamage(v, Math.min(0.08, hit * 0.01)); emit(g, "dig"); puff(g, "dust", nx, nz, 5); }
+    v.speed *= -0.2;
+  } else {
     if (grade > 0) v.speed *= Math.exp(-grade * 2.5 * dt);
     v.x = nx; v.z = nz;
   }
@@ -150,8 +182,9 @@ function stepVehicle(g: Game, v: Vehicle, throttle: number, steer: number, dt: n
   else {
     v.pitch += (tp - v.pitch) * k; v.roll += (trl - v.roll) * k;
     const topHeavy = v.kind === "truck" ? 1 + (v.dirt + v.rock) / TRUCK_CAPACITY * 0.4 : 1;
-    if (Math.abs(v.roll) * topHeavy > TIP_ROLL || Math.abs(v.pitch) > TIP_PITCH) {
+    if (Math.abs(v.roll) * topHeavy > TIP_ROLL * D.tip || Math.abs(v.pitch) > TIP_PITCH * D.tip) {
       v.tipped = true; v.speed = 0;
+      g.rollovers++; addDamage(v, 0.2); emit(g, "tip"); puff(g, "dust", v.x, v.z, 14);
       if (g.vehicles[g.active] === v) say(g, "Rolled over! Press R to recover");
     }
   }
@@ -185,6 +218,10 @@ export function currentAction(g: Game): Action {
   if (v.tipped) return null;
   const fx = Math.sin(v.heading), fz = Math.cos(v.heading);
   const px = v.x + fx * 3.2, pz = v.z + fz * 3.2; // reach point
+  const pump = g.pump;
+  if (pump && v.kind !== "crane" && Math.hypot(v.x - pump.x, v.z - pump.z) < pump.r && (v.fuel < 0.97 || v.damage > 0.03)) {
+    return { label: "Refuel & repair", time: REFUEL_TIME, run: () => { v.fuel = 1; v.damage = 0; emit(g, "load"); say(g, "Tank full, machine repaired"); } };
+  }
   if (g.site) return siteAction(g, g.site, v, px, pz);
   if (v.kind === "excavator") {
     const held = v.dirt + v.rock;
@@ -249,18 +286,18 @@ function siteAction(g: Game, s: Site, v: Vehicle, px: number, pz: number): Actio
     if (v.dirt + v.rock === 0) {
       const cell = nextDigCell(s, px, pz);
       if (cell < 0) return s.dug.size < s.pitCells.length ? { label: "Move closer to the next part of the pit", time: Infinity, run: () => {} } : null;
-      return { label: "Dig foundation", time: DIG_TIME, run: () => { digCell(w, s, cell); v.dirt = 1; } };
+      return { label: "Dig foundation", time: DIG_TIME, run: () => { digCell(w, s, cell); v.dirt = 1; emit(g, "dig"); puff(g, "dirt", px, pz, 6); } };
     }
     const truck = g.vehicles.find((o) => o.kind === "truck" && Math.hypot(o.x - px, o.z - pz) < 4 && !o.tipped);
     if (!truck) return { label: "Swing the bucket over the dump truck", time: Infinity, run: () => {} };
     if (truck.dirt + truck.rock >= TRUCK_CAPACITY) return { label: "Truck is full", time: Infinity, run: () => {} };
-    return { label: "Load into truck", time: LOAD_TIME, run: () => { truck.dirt += v.dirt; truck.rock += v.rock; v.dirt = 0; v.rock = 0; } };
+    return { label: "Load into truck", time: LOAD_TIME, run: () => { truck.dirt += v.dirt; truck.rock += v.rock; v.dirt = 0; v.rock = 0; emit(g, "load"); } };
   }
   if (v.kind === "truck") {
     const load = v.dirt + v.rock;
     if (load === 0) return null;
     if (!inSpoilZone(s, v.x, v.z)) return { label: "Haul the spoil to the pad outside the west gate", time: Infinity, run: () => {} };
-    return { label: `Dump load (${load})`, time: DUMP_TIME, run: () => { haulSpoil(s, load); v.dirt = 0; v.rock = 0; } };
+    return { label: `Dump load (${load})`, time: DUMP_TIME, run: () => { haulSpoil(s, load); v.dirt = 0; v.rock = 0; emit(g, "dump"); puff(g, "dirt", v.x - Math.sin(v.heading) * 2.5, v.z - Math.cos(v.heading) * 2.5, 8); } };
   }
   return null;
 }
@@ -269,6 +306,7 @@ function siteAction(g: Game, s: Site, v: Vehicle, px: number, pz: number): Actio
 export function craneAction(g: Game): boolean {
   if (!g.site || g.vehicles[g.active].kind !== "crane") return false;
   say(g, toggleHook(g.site));
+  emit(g, "hook");
   return true;
 }
 
@@ -286,7 +324,7 @@ export function stepGame(g: Game, inp: Input, dt: number) {
   g.vehicles.forEach((v, i) => {
     if (v.kind === "crane") return; // fixed base; the jib is simulated in site.crane
     const me = i === g.active;
-    stepVehicle(g, v, me ? inp.throttle : 0, me ? inp.steer : 0, dt);
+    stepVehicle(g, v, me ? inp.throttle : 0, me ? inp.steer : 0, dt, me);
   });
   const v = g.vehicles[g.active];
   if (g.site) {
@@ -294,7 +332,7 @@ export function stepGame(g: Game, inp: Input, dt: number) {
     stepSite(g.site, g.world, cr, dt);
     for (const m of g.site.notes.splice(0)) say(g, m);
     if (buildingStarted(g.site)) evictFromFootprint(g, g.site);
-    if (!g.won && g.site.toppedOut) g.won = true;
+    if (!g.won && g.site.toppedOut) { g.won = true; emit(g, "win"); }
   }
   const act = inp.action ? currentAction(g) : null;
   if (act && Number.isFinite(act.time) && Math.abs(v.speed) < 1) {
@@ -303,6 +341,7 @@ export function stepGame(g: Game, inp: Input, dt: number) {
   } else g.actionT = 0;
   for (const o of g.vehicles) o.work += ((o === v && g.actionT > 0 ? 1 : 0) - o.work) * (1 - Math.exp(-5 * dt));
   if (g.msgT > 0) g.msgT -= dt;
+  if (!g.won) g.time += dt;
   if (!g.site && !g.won && progress(g.world).paved >= 0.95) { g.won = true; }
 }
 
@@ -315,24 +354,49 @@ function evictFromFootprint(g: Game, s: Site) {
   }
 }
 
+/** Jump straight to machine `i` (Tab / number keys), wherever it is. */
+export function selectVehicle(g: Game, i: number) {
+  if (i < 0 || i >= g.vehicles.length || i === g.active) return;
+  const from = g.vehicles[g.active];
+  from.speed = 0; g.actionT = 0;
+  if (from.kind !== "crane") g.prevActive = g.active;
+  g.active = i; g.cam = "overview";
+  emit(g, "switch");
+  const to = g.vehicles[i];
+  if (to.kind === "crane") say(g, "Crane: A/D slew · W/S trolley · ↑/↓ hoist · Space hook · V camera");
+  else say(g, `Now driving: ${MACHINES[to.kind].nick} the ${MACHINES[to.kind].label}`);
+}
+
+export function cycleVehicle(g: Game, dir: 1 | -1 = 1) {
+  const n = g.vehicles.length;
+  selectVehicle(g, (g.active + dir + n) % n);
+}
+
+/** E: hop into the nearest machine (or the crane when close to its base); from the crane, climb back down. */
 export function switchVehicle(g: Game) {
   const v = g.vehicles[g.active];
   if (v.kind === "crane") {
-    g.active = g.prevActive; g.cam = "overview"; g.actionT = 0;
+    g.active = g.prevActive; g.cam = "overview"; g.actionT = 0; emit(g, "switch");
     say(g, `Now driving: ${MACHINES[g.vehicles[g.active].kind].label}`);
     return;
   }
   let best = -1, bd = 7;
   g.vehicles.forEach((o, i) => { if (i !== g.active) { const d = Math.hypot(o.x - v.x, o.z - v.z); if (d < bd) { bd = d; best = i; } } });
   if (best < 0) { say(g, "Drive closer to another machine to hop in"); return; }
-  v.speed = 0; g.prevActive = g.active; g.active = best; g.actionT = 0;
-  if (g.vehicles[best].kind === "crane") say(g, "Crane: A/D slew · W/S trolley · ↑/↓ hoist · Space hook · C camera · E climb down");
+  v.speed = 0; g.prevActive = g.active; g.active = best; g.actionT = 0; emit(g, "switch");
+  if (g.vehicles[best].kind === "crane") say(g, "Crane: A/D slew · W/S trolley · ↑/↓ hoist · Space hook · V camera · E climb down");
   else say(g, `Now driving: ${MACHINES[g.vehicles[best].kind].label}`);
 }
 
 export function recover(g: Game) {
   const v = g.vehicles[g.active], w = g.world;
   if (v.kind === "crane") return;
+  if (v.fuel <= 0 && g.pump) { // out of fuel: tow to the tank, with a time penalty
+    v.x = g.pump.x + 4; v.z = g.pump.z; v.y = heightAt(w, v.x, v.z); v.heading = Math.PI;
+    v.fuel = 0.3; v.tipped = false; v.roll = 0; v.pitch = 0; v.speed = 0; g.time += TOW_PENALTY;
+    say(g, `Towed to the fuel tank (+${TOW_PENALTY} s)`);
+    return;
+  }
   if (g.site) {
     const r = g.site.cfg.respawn;
     v.x = r.x + g.active * 5; v.z = r.z; v.heading = r.heading; v.y = heightAt(w, v.x, v.z);

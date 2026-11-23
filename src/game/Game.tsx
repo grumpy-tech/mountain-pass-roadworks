@@ -44,7 +44,7 @@ export default function Game() {
   const props = { settings, onCycleLighting: cycleLighting, onCycleWeather: cycleWeather, onToggleMute: toggleMute, onExit: exit, onRestart: restart };
   return (
     <GameBoundary onBack={back}>
-      {level === "timber-ridge" ? <ForestLevel key={run} {...props} /> : level === "tower-block" ? <UrbanLevel key={run} onExit={exit} /> : <RoadLevel key={run} {...props} />}
+      {level === "timber-ridge" ? <ForestLevel key={run} {...props} /> : level === "tower-block" ? <UrbanLevel key={run} {...props} /> : <RoadLevel key={run} {...props} />}
     </GameBoundary>
   );
 }

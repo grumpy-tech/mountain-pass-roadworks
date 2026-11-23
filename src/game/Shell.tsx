@@ -21,7 +21,11 @@ export interface BaseGame {
   vehicles: BaseVehicle[]; active: number; msg: string; msgT: number; actionT: number; won: boolean;
   time: number; rollovers: number; events: string[]; fx: Fx[]; env: Env;
 }
-export interface Input { throttle: number; steer: number; action: boolean }
+export interface Input {
+  throttle: number; steer: number; action: boolean;
+  /** For machines that split the keys (a tower crane): W/S alone, and arrow up/down alone. `throttle` merges W/S with the arrows. */
+  trolley: number; lift: number;
+}
 export interface MachineInfo {
   label: string; nick: string; max: number; weight: number; paint: string;
   /** Headlight pair in the machine's local space: [x, y, z, half-spread]. */
@@ -57,6 +61,17 @@ export interface LevelSpec {
   refuelHint?(): string;
   /** Extra sentence for the instructions' fuel section (e.g. a field tank). */
   fuelNote?: string;
+  /** Extra control lines for the instructions popup, shown after the standard ones. */
+  controls?: [string, string][];
+  /** A key press the shell does not handle itself (not a repeat, not while paused). Return true if it was used. */
+  onKey?(key: string): boolean;
+  /**
+   * Level-specific camera (e.g. a crane's hook or cab view), called every frame while the game is not in photo mode.
+   * Return the point the sun should follow, or null to use the default chase camera.
+   */
+  camera?(cam: THREE.PerspectiveCamera, dt: number): [number, number, number] | null;
+  /** Extra HUD drawn over the canvas (hidden in photo mode), e.g. instrument panels. */
+  overlay?: ReactNode;
   /** Level meshes (terrain, props). */
   scene: ReactNode;
   /** One machine's mesh. `lamps` is true when it is dark enough for lights. */
@@ -145,7 +160,8 @@ function Director({ spec, paused, photo, photoOn, audio, bus, sim, settings, con
 
       const throttle = (keys.has("w") || keys.has("arrowup") ? 1 : 0) - (keys.has("s") || keys.has("arrowdown") ? 1 : 0);
       const steer = (keys.has("a") || keys.has("arrowleft") ? 1 : 0) - (keys.has("d") || keys.has("arrowright") ? 1 : 0);
-      spec.step({ throttle, steer, action: keys.has(" ") }, dt);
+      const trolley = (keys.has("w") ? 1 : 0) - (keys.has("s") ? 1 : 0), lift = (keys.has("arrowup") ? 1 : 0) - (keys.has("arrowdown") ? 1 : 0);
+      spec.step({ throttle, steer, action: keys.has(" "), trolley, lift }, dt);
       const v = g.vehicles[g.active], m = spec.machines[v.kind], dead = v.tipped || v.fuel <= 0;
       audio.update({
         speed: dead ? 0 : Math.min(1, Math.abs(v.speed) / m.max), throttle: dead ? 0 : throttle,
@@ -171,14 +187,19 @@ function Director({ spec, paused, photo, photoOn, audio, bus, sim, settings, con
 
     // ---- camera, sun, headlights ----
     const v = g.vehicles[g.active];
+    let sx = v.x, sy = v.y, sz = v.z; // where the sun looks
     if (!photo.current) {
-      camera.position.lerp(st.cam.set(v.x + 6, v.y + 42, v.z + 16), 1 - Math.exp(-3 * dt));
-      camera.lookAt(v.x, v.y, v.z);
+      const focus = spec.camera?.(camera as THREE.PerspectiveCamera, dt);
+      if (focus) [sx, sy, sz] = focus;
+      else {
+        camera.position.lerp(st.cam.set(v.x + 6, v.y + 42, v.z + 16), 1 - Math.exp(-3 * dt));
+        camera.lookAt(v.x, v.y, v.z);
+      }
     }
     const day = S.tod > 0.22 && S.tod < 0.82, a = ((S.tod - 0.22) / 0.6) * Math.PI;
     const ox = day ? Math.cos(a) * 45 : -22, oy = day ? Math.max(9, Math.sin(a) * 50) : 40, oz = day ? 14 : -12;
-    sun.current.position.set(v.x + ox, v.y + oy, v.z + oz);
-    sun.current.target.position.set(v.x, v.y, v.z);
+    sun.current.position.set(sx + ox, sy + oy, sz + oz);
+    sun.current.target.position.set(sx, sy, sz);
     sun.current.target.updateMatrixWorld();
     const lamp = spec.machines[v.kind].lamp, fx = Math.sin(v.heading), fz = Math.cos(v.heading), rx = Math.cos(v.heading), rz = -Math.sin(v.heading);
     const on = S.lamps && !v.tipped && v.fuel > 0 ? 260 : 0;
@@ -215,6 +236,7 @@ function Help({ spec, onClose }: { spec: LevelSpec; onClose: () => void }) {
     ["N  /  C", "Lighting: auto, day, night  /  weather"],
     ["P  /  M", "Photo mode  /  sound"],
     ["? or H", "Show / hide these instructions"],
+    ...(spec.controls ?? []),
   ];
   return (
     <div className="absolute inset-0 z-50 flex items-center justify-center bg-foreground/50 p-4" role="dialog" aria-modal="true" aria-label="Instructions">
@@ -324,6 +346,7 @@ export function LevelShell({ spec, settings, onCycleLighting, onCycleWeather, on
       if (k === "tab") spec.cycle(e.shiftKey ? -1 : 1);
       else if (/^[1-9]$/.test(k)) spec.select(Number(k) - 1);
       else if (k === "r") spec.recover();
+      else if (!e.repeat) spec.onKey?.(k);
       keys.add(k);
     };
     const up = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
@@ -415,6 +438,8 @@ export function LevelShell({ spec, settings, onCycleLighting, onCycleWeather, on
             </ul>
             <div className="mt-2 h-2 bg-muted"><div className="h-2 bg-primary" style={{ width: `${hud.progress * 100}%` }} /></div>
           </div>
+
+          {spec.overlay}
 
           {(hud.action || hud.msg) && (
             <div className="pointer-events-none absolute left-1/2 top-6 -translate-x-1/2 space-y-2 text-center font-mono text-sm">

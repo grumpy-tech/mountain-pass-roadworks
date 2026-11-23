@@ -104,7 +104,7 @@ function Light({ lit }: { lit: boolean }) {
   );
 }
 
-function Tank() {
+export function Tank() {
   return (
     <>
       <mesh position={[0, 1.5, 0]} rotation={[Math.PI / 2, 0, 0]} castShadow><cylinderGeometry args={[0.95, 0.95, 3.2, 10]} />{mat("#c8392b")}</mesh>

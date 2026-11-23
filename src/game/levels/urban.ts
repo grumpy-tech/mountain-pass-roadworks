@@ -46,6 +46,9 @@ export const URBAN_SITE: SiteConfig = {
   respawn: { x: -2, z: 12, heading: Math.PI },
 };
 
+/** Site fuel tank, in the east of the lot clear of the crane, pit and delivery pad. */
+export const URBAN_PUMP = { x: 27, z: 2, r: 6 };
+
 function createUrbanWorld(cfg: SiteConfig): World {
   const V = (N + 1) * (N + 1);
   const colors = new Float32Array(V * 3);
@@ -86,6 +89,6 @@ export const URBAN_LEVEL: LevelConfig = {
       spawnVehicle(world, "truck", -3, 8, Math.PI),
       spawnVehicle(world, "crane", c.x ?? 0, c.z ?? 0, 0),
     ];
-    return { world, vehicles, site, intro: "Dig the foundation: Space digs, load the dump truck, haul spoil out through the west gate" };
+    return { world, vehicles, site, pump: URBAN_PUMP, intro: "Dig the foundation: Space digs, load the dump truck, haul spoil out through the west gate" };
   },
 };

@@ -189,7 +189,7 @@ function Scenery({ world }: { world: World }) {
 
 const STACK_AT: Record<Machine, [number, number, number]> = { dozer: [0.5, 2.4, 0.6], excavator: [0.7, 2.5, -1.3], truck: [1.02, 3, 1.1], paver: [-0.55, 2.4, 0.5] };
 
-function VehicleMesh({ v, active, night }: { v: Vehicle; active: boolean; night: boolean }) {
+export function VehicleMesh({ v, active, night }: { v: Vehicle; active: boolean; night: boolean }) {
   const g = useRef<THREE.Group>(null!);
   const arm = useRef<THREE.Group>(null!), blade = useRef<THREE.Group>(null!), bed = useRef<THREE.Group>(null!), roller = useRef<THREE.Group>(null!);
   const load = useRef<THREE.Mesh>(null!);

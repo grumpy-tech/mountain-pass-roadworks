@@ -25,7 +25,7 @@ const CARDS: Card[] = [
   {
     id: "tower-block", title: "Tower Block", tag: "New",
     blurb: URBAN_LEVEL.blurb,
-    crew: URBAN_LEVEL.machines.map((kind) => ({ kind, nick: URBAN_MACHINES[kind as keyof typeof URBAN_MACHINES]?.label ?? kind })),
+    crew: URBAN_LEVEL.machines.map((kind) => ({ kind, nick: URBAN_MACHINES[kind].nick })),
   },
 ];
 
